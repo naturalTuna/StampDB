@@ -1,6 +1,6 @@
 # 진행 상황
 
-마지막 갱신: 2026-11-27 (1단계 5번 완료, 6번 설계 시작 전)
+마지막 갱신: 2026-11-27 (1단계 6번 진행 중, 4/7 단위 완료)
 
 ## 진행률
 
@@ -39,13 +39,17 @@ docs/         SETUP.md(환경), PROGRESS.md(이 문서), notes.md(구현 중 미
 
 테스트: 단위 149개 + 통합 23개 (모두 통과).
 
-## 다음 단계: 1단계 6번
+## 진행 중: 1단계 6번 (트랜잭션 + MVCC + lock manager)
 
-트랜잭션 + MVCC + 스냅샷 (Read Committed, Snapshot Isolation, trait 추상화, 통합 lock manager, deadlock 검출, lock_timeout).
-설계안을 제시하고 결정을 받는 중이다 (아래 "결정 대기").
+결정은 DESIGN.md r7로 확정됨. 구현 단위와 상태:
 
-### 결정 대기 (6단계 설계안에서 제시)
-6단계 설계안의 "결정 필요" 항목에 답을 받은 뒤 DESIGN.md r7로 반영한다.
+1. [완료] txn 기반: TxnId, ProcArray, Snapshot, TransactionManager trait
+2. [완료] CLOG(RelFileId 1, 버퍼 풀) + COMMIT/ABORT/ZERO_PAGE WAL + LocalTxnManager + next_xid 복구
+3. [완료] 가시성 판단 `access::visibility::satisfies_mvcc` (스냅샷 우선, hint 제안)
+4. [완료] lock manager `lock`: PG 8모드, FIFO, transaction lock, wait_for_xid, lock_timeout
+5. [다음] deadlock 검출: deadlock_timeout 경과 시 wait-for 그래프 사이클 검사, 요청 쪽 에러 (LockError::Deadlock 자리 있음)
+6. MVCC heap DML: 레코드에 쓰는 쪽 xid 기록(rec.xid, 복구 시 next_xid 계산에 필요), xmin/xmax, TM_Result류 충돌 결과, xid 대기, RC 최신 버전 추적 헬퍼, SI 직렬화 오류, 가시 튜플만 내보내는 스캔과 hint 일괄 설정
+7. 격리 수준 시나리오 테스트 + 크래시 후 미커밋 행 비가시 확인, 이후 PROGRESS 갱신
 
 ## 이전 단계에서 넘어온 한계와 미결 사항
 
