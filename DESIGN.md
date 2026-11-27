@@ -4,6 +4,11 @@
 decisions의 변경은 채팅 리뷰를 거친 뒤에만 반영하고, 반영 시 아래 변경 이력에 남긴다.
 
 ## 변경 이력
+- r5 (2026-11-27)
+  - [추가] B+Tree 키는 memcomparable 인코딩(바이트 비교 = 타입 순서)으로 저장하고 memcmp로 비교.
+  - [추가] B+Tree 엔트리 키 끝에 heap TID를 붙여 모든 엔트리를 고유하게 함.
+  - [추가] NULL도 색인하며 NULLS LAST.
+  - [추가] split 지점: 기본 50:50, 가장 오른쪽 leaf는 90:10.
 - r4 (2026-11-27)
   - [추가] hint bit 설정 방식: shared lock 아래에서는 설정하지 않고, exclusive lock을 얻었을 때(try_write 성공, 페이지 수정, vacuum)만 설정.
   - [추가] 튜플 헤더: cmin/cmax를 별도 필드로 저장 (combo CID 없음). 속성은 정렬 패딩 없이 연속 저장.
@@ -157,6 +162,14 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
   ha 모드의 reader 지연 재생에서 split 중간 상태를 읽어도 견고하다.
 - 페이지 merge는 하지 않는다. 완전히 빈 페이지만 vacuum이 삭제한다 (PG처럼 진행 중인 스캔을 고려한 2단계 삭제).
   근거: 동시성 하의 merge는 구현 난이도에 비해 OLTP 이득이 작다.
+- 키는 memcomparable 인코딩으로 저장하고 바이트 비교(memcmp)한다.
+  속성마다 NULL 표시 바이트, 정수/TIMESTAMP는 부호 비트를 뒤집은 big-endian, FLOAT8은 -0과 NaN을 정규화한 뒤 순서 보존 변환(NaN이 가장 큼), TEXT는 원본 바이트 + 0x00 종료.
+  근거: B+Tree가 타입을 몰라도 되고 비교가 빠르다. C collation이므로 텍스트 바이트 순서가 곧 정렬 순서다. Oracle의 NUMBER/DATE 내부 형식과 같은 발상이다. heap과 인덱스의 키 형식이 다르고, NUMERIC도 같은 성질의 인코딩을 별도로 설계해야 하는 비용을 감수한다.
+- 엔트리 키 끝에 heap TID를 붙여 모든 엔트리를 고유하게 한다 (PG 12+ heapkeyspace, Oracle non-unique 인덱스와 동일).
+  근거: vacuum이 지울 엔트리를 정확히 찾을 수 있고, 같은 키가 여러 페이지에 걸치는 경우를 따로 다루지 않아도 된다.
+- NULL도 색인하며 NULLS LAST로 정렬한다 (PG와 동일).
+- split 지점은 기본 50:50, 가장 오른쪽 leaf는 90:10.
+  근거: OLTP에서 흔한 순차 PK 삽입 시 페이지를 꽉 채운다 (PG fillfactor 90, Oracle 90/10 split과 같은 발상).
 
 [버퍼 풀]
 - PostgreSQL 방식: clock-sweep 교체, pin count, usage count.
