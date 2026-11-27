@@ -6,6 +6,18 @@ pub enum StorageError {
     /// Underlying OS I/O failure.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Direct I/O buffer length is zero or not a multiple of the alignment.
+    #[error("invalid aligned buffer size: {len}")]
+    InvalidBufferSize { len: usize },
+
+    /// A page buffer does not have exactly `PAGE_SIZE` bytes.
+    #[error("invalid page length: {len}")]
+    InvalidPageLength { len: usize },
+
+    /// A page header failed validation.
+    #[error("corrupt page: {0}")]
+    CorruptPage(&'static str),
 }
 
 /// Result alias for the storage layer.
