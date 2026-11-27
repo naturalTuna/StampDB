@@ -259,6 +259,20 @@ impl BufferPool {
         Ok(self.disk.sync_pending()?)
     }
 
+    /// Drops a relation for good: discards its buffers, deletes its file
+    /// (a missing file is fine), and forgets its free space.
+    pub fn remove_relation(&self, rel: RelFileId) -> Result<()> {
+        self.drop_relation_buffers(rel)?;
+        match self.disk.remove_relation(rel, self.fence_token()) {
+            Ok(()) => {}
+            Err(crate::storage::StorageError::FileIo { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        self.fsm.forget(rel);
+        Ok(())
+    }
+
     /// Discards all buffers of `rel` without writing them (for DROP TABLE;
     /// PostgreSQL's `DropRelationBuffers`).
     ///

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use super::{CommandId, Snapshot, TransactionManager, TxnError, TxnId, Xid};
 use crate::lock::{LockError, LockManager, LockMode, LockTag, WaitPolicy};
+use crate::storage::backend::RelFileId;
 
 /// Supported isolation levels (DESIGN: no SSI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +50,10 @@ pub struct Transaction {
     snapshot: Option<Snapshot>,
     policy: WaitPolicy,
     finished: bool,
+    /// Relation files to delete if the transaction commits (DROP).
+    drop_on_commit: Vec<RelFileId>,
+    /// Relation files to delete if it aborts (CREATE).
+    drop_on_abort: Vec<RelFileId>,
 }
 
 impl Transaction {
@@ -69,6 +74,8 @@ impl Transaction {
             snapshot: None,
             policy,
             finished: false,
+            drop_on_commit: Vec::new(),
+            drop_on_abort: Vec::new(),
         }
     }
 
@@ -146,14 +153,20 @@ impl Transaction {
     }
 
     /// Takes a table lock until the transaction ends.
-    pub fn lock_relation(
-        &self,
-        rel: crate::storage::backend::RelFileId,
-        mode: LockMode,
-    ) -> Result<()> {
+    pub fn lock_relation(&self, rel: RelFileId, mode: LockMode) -> Result<()> {
         Ok(self
             .locks
             .acquire(self.id, LockTag::Relation(rel), mode, self.policy)?)
+    }
+
+    /// Deletes `rel`'s file if this transaction aborts (it created it).
+    pub fn drop_on_abort(&mut self, rel: RelFileId) {
+        self.drop_on_abort.push(rel);
+    }
+
+    /// Deletes `rel`'s file once this transaction commits (it dropped it).
+    pub fn drop_on_commit(&mut self, rel: RelFileId) {
+        self.drop_on_commit.push(rel);
     }
 
     pub fn commit(mut self) -> Result<()> {
@@ -170,8 +183,8 @@ impl Transaction {
         }
         self.finished = true;
         let res = match self.xid {
-            Some(x) if commit => self.tm.commit(x),
-            Some(x) => self.tm.abort(x),
+            Some(x) if commit => self.tm.commit_dropping(x, &self.drop_on_commit),
+            Some(x) => self.tm.abort_dropping(x, &self.drop_on_abort),
             None => Ok(()),
         };
         // Locks go after the outcome is recorded, so waiters see it.

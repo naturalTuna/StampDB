@@ -172,6 +172,9 @@ impl Engine {
                     max_oid = max_oid.max(u32::from_le_bytes(b));
                 }
                 apply(&disk, &pool, &d.record, start, end, fence.as_ref())?;
+                for rel in crate::txn::clog::dropped_rels(&d.record) {
+                    pool.remove_relation(rel)?;
+                }
             }
             pool.flush_all()?;
             (rd.end_lsn(), rd.last_start(), max_xid)
@@ -305,6 +308,11 @@ fn apply(
         _ => {}
     }
     for (idx, b) in rec.blocks.iter().enumerate() {
+        // A relation dropped later in the WAL may already be gone: recreate
+        // it so replay can continue; the later commit record deletes it.
+        if matches!(disk.nblocks(b.rel), Err(ref e) if super::is_not_found(e)) {
+            disk.create_relation(b.rel, fence.fence_token())?;
+        }
         // Blocks extended but never written before the crash: re-extend.
         while disk.nblocks(b.rel)? <= b.blk.0 {
             drop(pool.extend(b.rel)?);
@@ -661,6 +669,93 @@ mod tests {
             XidStatus::Committed
         );
         assert_eq!(e.txn().assign_xid().unwrap(), Xid::FIRST);
+    }
+
+    fn txn(e: &Engine, locks: &Arc<crate::lock::LockManager>) -> crate::txn::Transaction {
+        let tm: Arc<dyn crate::txn::TransactionManager> = e.txn().clone();
+        crate::txn::Transaction::begin(
+            tm,
+            locks.clone(),
+            crate::txn::Isolation::ReadCommitted,
+            crate::lock::WaitPolicy::default(),
+        )
+    }
+
+    fn exists(mem: &MemBackend, rel: RelFileId) -> bool {
+        mem.file_len(FileKey::Relation(rel)).is_ok()
+    }
+
+    #[test]
+    fn created_file_is_removed_on_abort() {
+        let mem = fresh();
+        let e = start(&mem, 16);
+        let locks = Arc::new(crate::lock::LockManager::new());
+        let mut t = txn(&e, &locks);
+        t.write_xid().unwrap();
+        e.create_relation(HEAP).unwrap();
+        t.drop_on_abort(HEAP);
+        assert!(exists(&mem, HEAP));
+        t.abort().unwrap();
+        assert!(!exists(&mem, HEAP));
+    }
+
+    #[test]
+    fn dropped_file_is_removed_only_on_commit() {
+        let mem = fresh();
+        let e = start(&mem, 16);
+        let locks = Arc::new(crate::lock::LockManager::new());
+        e.create_relation(HEAP).unwrap();
+        let mut t = txn(&e, &locks);
+        t.write_xid().unwrap();
+        t.drop_on_commit(HEAP);
+        t.abort().unwrap();
+        assert!(exists(&mem, HEAP), "DROP rolled back");
+        let mut t = txn(&e, &locks);
+        t.write_xid().unwrap();
+        t.drop_on_commit(HEAP);
+        t.commit().unwrap();
+        assert!(!exists(&mem, HEAP));
+    }
+
+    #[test]
+    fn replay_of_a_later_dropped_relation() {
+        let mem = fresh();
+        {
+            let e = start(&mem, 16);
+            let locks = Arc::new(crate::lock::LockManager::new());
+            e.checkpoint().unwrap();
+            create_tables(&e);
+            load(&e, 0..200); // page records for HEAP and IDX
+            let mut t = txn(&e, &locks);
+            t.write_xid().unwrap();
+            t.drop_on_commit(HEAP);
+            t.drop_on_commit(IDX);
+            t.commit().unwrap(); // files deleted
+            assert!(!exists(&mem, HEAP));
+        }
+        // Replay meets HEAP/IDX page records with the files gone.
+        let e = start(&mem, 16);
+        assert!(!exists(&mem, HEAP) && !exists(&mem, IDX));
+        drop(e);
+    }
+
+    #[test]
+    fn deletion_is_redone_from_the_commit_record() {
+        let mem = fresh();
+        {
+            let e = start(&mem, 16);
+            let locks = Arc::new(crate::lock::LockManager::new());
+            e.create_relation(HEAP).unwrap();
+            let mut t = txn(&e, &locks);
+            t.write_xid().unwrap();
+            t.drop_on_commit(HEAP);
+            t.commit().unwrap();
+        }
+        // As if the process died between the commit and the unlink.
+        mem.create(FileKey::Relation(HEAP), FENCE).unwrap();
+        let e = start(&mem, 16);
+        assert!(!exists(&mem, HEAP), "recovery deletes it");
+        drop(e);
     }
 
     #[test]

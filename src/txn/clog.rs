@@ -40,9 +40,11 @@ const BITS_ABORTED: u8 = 0b10;
 /// `info` values of the Xact resource manager. Each record's xid is the
 /// transaction concerned.
 pub mod xact_info {
-    /// Block 0: the CLOG page; redo marks the xid committed.
+    /// Block 0: the CLOG page; redo marks the xid committed. Main data:
+    /// relation files to delete (u32 each), the transaction's DROPs.
     pub const COMMIT: u8 = 0;
-    /// Block 0: the CLOG page; redo marks the xid aborted.
+    /// Block 0: the CLOG page; redo marks the xid aborted. Main data:
+    /// relation files to delete (u32 each), the transaction's CREATEs.
     pub const ABORT: u8 = 1;
     /// Block 0 (will-init): a new, all-in-progress CLOG page.
     pub const ZERO_PAGE: u8 = 2;
@@ -144,7 +146,7 @@ impl Clog {
 
     /// Records the outcome of `xid`: sets its bits and logs a COMMIT or
     /// ABORT record. Returns the record's end LSN (to flush for a commit).
-    pub fn record_outcome(&self, xid: Xid, committed: bool) -> Result<Lsn> {
+    pub fn record_outcome(&self, xid: Xid, committed: bool, drop: &[RelFileId]) -> Result<Lsn> {
         self.ensure(xid)?;
         let blk = page_of(xid);
         let pin = self.pool.fetch(BufferTag { rel: CLOG_REL, blk })?;
@@ -158,10 +160,29 @@ impl Clog {
         page.mark_dirty();
         let mut rec = Record::new(RmgrId::Xact, info);
         rec.xid = xid;
+        rec.main = encode_rels(drop);
         rec.blocks.push(BlockRef::new(CLOG_REL, blk));
         log_and_stamp(self.pool.wal(), rec, &mut [&mut page[..]]);
         Ok(crate::storage::page::page_lsn(&page))
     }
+}
+
+fn encode_rels(rels: &[RelFileId]) -> Vec<u8> {
+    rels.iter().flat_map(|r| r.0.to_le_bytes()).collect()
+}
+
+/// Relation files a COMMIT or ABORT record deletes.
+pub fn dropped_rels(rec: &Record) -> Vec<RelFileId> {
+    if rec.rmgr != RmgrId::Xact || !(rec.info == xact_info::COMMIT || rec.info == xact_info::ABORT)
+    {
+        return Vec::new();
+    }
+    rec.main
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| RelFileId(u32::from_le_bytes(*b)))
+        .collect()
 }
 
 /// Redo of an Xact record's block (which carries no image).

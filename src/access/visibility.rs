@@ -169,10 +169,18 @@ mod tests {
         fn status(&self, xid: Xid) -> crate::txn::Result<XidStatus> {
             Ok(self.0.get(&xid).copied().unwrap_or(XidStatus::InProgress))
         }
-        fn commit(&self, _: Xid) -> crate::txn::Result<()> {
+        fn commit_dropping(
+            &self,
+            _: Xid,
+            _: &[crate::storage::backend::RelFileId],
+        ) -> crate::txn::Result<()> {
             Ok(())
         }
-        fn abort(&self, _: Xid) -> crate::txn::Result<()> {
+        fn abort_dropping(
+            &self,
+            _: Xid,
+            _: &[crate::storage::backend::RelFileId],
+        ) -> crate::txn::Result<()> {
             Ok(())
         }
     }

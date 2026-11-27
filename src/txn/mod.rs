@@ -21,6 +21,8 @@ pub use transaction::{Isolation, Transaction, TransactionError};
 
 use std::fmt;
 
+use crate::storage::backend::RelFileId;
+
 /// 64-bit transaction ID (no wraparound, no freezing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Xid(pub u64);
@@ -105,8 +107,19 @@ pub trait TransactionManager: Send + Sync + fmt::Debug {
     fn status(&self, xid: Xid) -> Result<XidStatus>;
 
     /// Makes `xid` committed durably, then visible to new snapshots.
-    fn commit(&self, xid: Xid) -> Result<()>;
+    fn commit(&self, xid: Xid) -> Result<()> {
+        self.commit_dropping(xid, &[])
+    }
 
     /// Marks `xid` aborted and removes it from the running set.
-    fn abort(&self, xid: Xid) -> Result<()>;
+    fn abort(&self, xid: Xid) -> Result<()> {
+        self.abort_dropping(xid, &[])
+    }
+
+    /// Commits `xid`, then deletes the relation files it dropped. The list
+    /// is in the commit record, so recovery deletes them too.
+    fn commit_dropping(&self, xid: Xid, drop: &[RelFileId]) -> Result<()>;
+
+    /// Aborts `xid`, then deletes the relation files it created.
+    fn abort_dropping(&self, xid: Xid, drop: &[RelFileId]) -> Result<()>;
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use super::clog::Clog;
 use super::{ProcArray, Result, Snapshot, TransactionManager, TxnError, TxnId, Xid, XidStatus};
 use crate::buffer::BufferPool;
+use crate::storage::backend::RelFileId;
 
 /// Single-node implementation of [`TransactionManager`].
 #[derive(Debug)]
@@ -34,18 +35,27 @@ impl LocalTxnManager {
         self.procs.is_running(xid)
     }
 
-    fn finish(&self, xid: Xid, committed: bool) -> Result<()> {
+    fn finish(&self, xid: Xid, committed: bool, drop: &[RelFileId]) -> Result<()> {
         if !self.procs.is_running(xid) {
             return Err(TxnError::NotRunning(xid));
         }
-        let end = self.clog.record_outcome(xid, committed).map_err(clog_err)?;
-        if committed {
-            // Durable before anyone can see it as committed.
+        let end = self
+            .clog
+            .record_outcome(xid, committed, drop)
+            .map_err(clog_err)?;
+        if committed || !drop.is_empty() {
+            // A commit is durable before anyone can see it as committed;
+            // files are deleted only once the record saying so is durable.
             if let Some(wal) = self.pool.wal() {
                 wal.flush_to(end);
             }
         }
         self.procs.remove(xid);
+        for &rel in drop {
+            self.pool
+                .remove_relation(rel)
+                .map_err(|e| TxnError::Clog(format!("deleting relation {}: {e}", rel.0)))?;
+        }
         Ok(())
     }
 }
@@ -101,12 +111,12 @@ impl TransactionManager for LocalTxnManager {
         }
     }
 
-    fn commit(&self, xid: Xid) -> Result<()> {
-        self.finish(xid, true)
+    fn commit_dropping(&self, xid: Xid, drop: &[RelFileId]) -> Result<()> {
+        self.finish(xid, true, drop)
     }
 
-    fn abort(&self, xid: Xid) -> Result<()> {
-        self.finish(xid, false)
+    fn abort_dropping(&self, xid: Xid, drop: &[RelFileId]) -> Result<()> {
+        self.finish(xid, false, drop)
     }
 }
 
@@ -178,7 +188,7 @@ mod tests {
         let x = tm.assign_xid().unwrap();
         // Bits written but the transaction still registered as running:
         // the state between setting the bits and the end of commit.
-        tm.clog.record_outcome(x, true).unwrap();
+        tm.clog.record_outcome(x, true, &[]).unwrap();
         assert_eq!(tm.status(x).unwrap(), XidStatus::InProgress);
         tm.procs.remove(x);
         assert_eq!(tm.status(x).unwrap(), XidStatus::Committed);
