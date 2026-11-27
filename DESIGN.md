@@ -4,6 +4,12 @@
 decisions의 변경은 채팅 리뷰를 거친 뒤에만 반영하고, 반영 시 아래 변경 이력에 남긴다.
 
 ## 변경 이력
+- r7 (2026-11-27)
+  - [추가] CLOG는 버퍼 풀을 쓰는 전용 relation에 둔다. 커밋 레코드 flush 후 CLOG 비트 설정, 체크포인트 후 첫 변경은 FPI.
+  - [추가] 테이블 lock은 PG의 8가지 모드와 충돌표.
+  - [추가] 행 갱신 대기는 xmax 트랜잭션 종료를 기다린 뒤 재시도 (튜플 lock 없음).
+  - [추가] xid는 첫 쓰기 시 발급, lock 소유자는 트랜잭션별 TxnId.
+  - [추가] 동기 커밋만 지원. SAVEPOINT/하위 트랜잭션은 이번 범위 밖.
 - r6 (2026-11-27)
   - [추가] WAL 레코드는 연산 단위 physiological 방식 (PG 방식, rmgr별 redo 함수).
   - [추가] critical section 오류와 fsync 실패 시 프로세스 abort 후 WAL 복구 (PG PANIC, data_sync_retry=off).
@@ -208,6 +214,15 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
   - 대기가 deadlock_timeout(기본 1초)을 넘으면 wait-for 그래프를 검사해 사이클이 있으면 요청한 쪽 트랜잭션을 에러로 취소한다 (PG와 동일).
   - lock_timeout 설정을 지원한다 (기본 0 = 무제한).
   - latch는 교착 검출 대상이 아니다. latch는 정해진 획득 순서로 교착을 원천 차단한다.
+- 트랜잭션 식별: 트랜잭션마다 TxnId(u64, PG의 vxid에 해당)를 두고 lock 소유자로 쓴다. 64비트 xid는 첫 쓰기 시에만 발급한다 (읽기 전용 트랜잭션은 xid를 소비하지 않음).
+  복구 시 다음 xid는 max(control 파일의 next_xid, WAL에서 본 최대 xid + 1).
+- 커밋은 동기 방식만 지원한다: 커밋 레코드 → WAL flush → CLOG 설정 → 실행 중 목록에서 제거.
+  근거: "커밋됨"이 커밋 레코드 flush 이후에만 보이므로 hint bit 정책이 자동으로 지켜진다. 비동기 커밋은 hint 설정에 커밋 LSN 추적이 필요하다.
+- CLOG는 버퍼 풀을 쓰는 전용 relation에 트랜잭션당 2비트로 둔다. CLOG 비트는 커밋/abort 레코드에서 redo하고, 체크포인트 이후 첫 변경 시 hint처럼 FPI를 남긴다.
+  근거: 체크섬, FPW, WAL-before-data, 체크포인트를 그대로 재사용한다 (PG의 SLRU 별도 캐시 대신).
+- 테이블 lock 모드는 PG의 8가지(AccessShare ~ AccessExclusive)와 같은 충돌표를 쓴다.
+- 행 갱신 충돌 시 xmax 트랜잭션의 종료를 lock manager로 기다린 뒤 재시도한다 (PG의 튜플 lock 단계는 두지 않는다). 대기 순서의 공정성은 보장하지 않는다.
+- SAVEPOINT와 하위 트랜잭션은 지원하지 않는다 (필요해지면 open_questions로).
 
 [제약조건]
 - NOT NULL, CHECK, PRIMARY KEY, UNIQUE, FOREIGN KEY.
