@@ -35,6 +35,35 @@ cargo fmt --check
 - `cargo test`에는 실제 O_DIRECT 파일 I/O 테스트와 kill -9 테스트(`tests/crash.rs`, 자기 자신을 작업 모드로 다시 실행해 SIGKILL)가 들어 있다. 이 테스트들은 `target/tmp` 아래에 임시 디렉터리를 만든다.
 - 처음 실행할 때 crates.io에서 의존성을 내려받는다 (인터넷 필요).
 
+## sqllogictest 기대값 생성용 PostgreSQL (DESIGN r11)
+
+`tests/slt/*.slt`의 query 결과는 C locale PostgreSQL이 만든 값이다. `cargo test`는 저장된 기대값으로만 비교하므로 PostgreSQL이 없어도 된다. 테스트 파일을 추가하거나 고칠 때만 아래 환경이 필요하다.
+
+sudo 없이 홈 디렉터리에 소스 빌드한다 (RHEL 9 기준, 이 VM에서 쓴 방법):
+
+```sh
+# bison/flex/m4가 없으면 GNU 소스로 ~/pgsrc/local에 설치
+#   m4-1.4.19, bison-3.8.2, flex-2.6.4: ./configure --prefix=$HOME/pgsrc/local && make && make install
+# 빌드 스크립트가 쓰는 Perl 모듈(FindBin, File::Compare, File::Copy, File::Find, Tie::File, Time::HiRes)이
+# 없으면 `dnf download perl-FindBin ...` 후 rpm2cpio로 ~/pgsrc/perlrpm에 풀고 PERL5LIB로 지정
+export PATH=$HOME/pgsrc/local/bin:$PATH
+export PERL5LIB=$HOME/pgsrc/perlrpm/usr/share/perl5:$HOME/pgsrc/perlrpm/usr/lib64/perl5/vendor_perl
+cd ~/pgsrc/postgresql-18.3
+./configure --prefix=$HOME/pg18 --without-readline --without-zlib --without-icu --without-zstd --without-lz4
+make -j4 && make install
+
+# C locale 클러스터, 유닉스 소켓만 (TCP 수신 없음)
+~/pg18/bin/initdb -D ~/pgdata --locale=C -E UTF8 -A trust -U postgres
+~/pg18/bin/pg_ctl -D ~/pgdata -o "-p 54321 -k /tmp -c listen_addresses=''" -l ~/pgsrc/pg.log start
+```
+
+기대값 다시 만들기 (각 파일을 새 데이터베이스에서 psql로 실행해 query 결과를 덮어쓰고, statement ok/error가 PostgreSQL과 같은지 확인한다):
+
+```sh
+MYDB_PSQL=$HOME/pg18/bin/psql PGHOST=/tmp PGPORT=54321 PGUSER=postgres \
+  cargo test --test sqllogic -- --ignored complete_with_postgres
+```
+
 ## Claude Code로 이어서 작업하기
 
 1. 저장소 루트에서 Claude Code를 실행한다. `CLAUDE.md`가 자동으로 읽힌다.

@@ -1552,6 +1552,16 @@ impl<'a> Binder<'a> {
                     DataType::Bool,
                 )
             }
+            E::IsUnknown(a) | E::IsNotUnknown(a) => {
+                let b = to_bool(self.bind_expr(a, scope, clause)?, "IS UNKNOWN")?;
+                BExpr::known(
+                    Expr::IsNull {
+                        arg: Box::new(b),
+                        negated: matches!(e, E::IsNotUnknown(_)),
+                    },
+                    DataType::Bool,
+                )
+            }
             E::IsTrue(a) | E::IsNotTrue(a) | E::IsFalse(a) | E::IsNotFalse(a) => {
                 let b = to_bool(self.bind_expr(a, scope, clause)?, "IS")?;
                 let b = if matches!(e, E::IsFalse(_) | E::IsNotFalse(_)) {
@@ -2075,6 +2085,12 @@ fn literal(v: &ast::Value, negate: bool) -> Result<BExpr> {
             let f: f64 = text
                 .parse()
                 .map_err(|_| err(code::SYNTAX_ERROR, format!("invalid number {text}")))?;
+            // numeric has no negative zero: -0.0 is 0 (and prints "0.0").
+            let (f, text) = if f == 0.0 {
+                (0.0, text.trim_start_matches('-').to_owned())
+            } else {
+                (f, text)
+            };
             BExpr {
                 expr: Expr::Const(Value::Float8(f)),
                 ty: Ty::Numeric(text),

@@ -1,0 +1,172 @@
+statement ok
+CREATE TABLE t (k INT, v TEXT, n FLOAT8)
+
+statement ok
+CREATE UNIQUE INDEX t_k ON t (k)
+
+statement ok
+CREATE INDEX t_v ON t (v)
+
+statement ok
+INSERT INTO t VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', NULL)
+
+statement ok
+INSERT INTO t (v, k) VALUES ('four', 4)
+
+statement ok
+INSERT INTO t SELECT k + 10, v || '!', n FROM t WHERE k <= 2
+
+query ITR
+SELECT * FROM t ORDER BY k
+----
+1 one 1.5
+2 two 2.5
+3 three NULL
+4 four NULL
+11 one! 1.5
+12 two! 2.5
+
+statement error duplicate key value violates unique constraint "t_k"
+INSERT INTO t VALUES (1, 'dup', 0)
+
+statement ok
+UPDATE t SET n = k * 10 WHERE n IS NULL
+
+statement ok
+UPDATE t SET v = upper(v), k = k + 100 WHERE k > 10
+
+query ITR
+SELECT * FROM t ORDER BY k
+----
+1 one 1.5
+2 two 2.5
+3 three 30
+4 four 40
+111 ONE! 1.5
+112 TWO! 2.5
+
+query IT
+SELECT k, v FROM t WHERE k = 111
+----
+111 ONE!
+
+query I
+SELECT k FROM t WHERE v = 'two'
+----
+2
+
+statement error duplicate key value violates unique constraint "t_k"
+UPDATE t SET k = 1 WHERE k = 2
+
+statement ok
+DELETE FROM t WHERE k > 100
+
+query I
+SELECT count(*) FROM t
+----
+4
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (5, 'five', 5)
+
+statement ok
+UPDATE t SET n = -1 WHERE k = 1
+
+query IR
+SELECT k, n FROM t ORDER BY k
+----
+1 -1
+2 2.5
+3 30
+4 40
+5 5
+
+statement ok
+ROLLBACK
+
+query IR
+SELECT k, n FROM t ORDER BY k
+----
+1 1.5
+2 2.5
+3 30
+4 40
+
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM t WHERE k = 4
+
+statement ok
+COMMIT
+
+query I
+SELECT k FROM t ORDER BY k
+----
+1
+2
+3
+
+statement ok
+BEGIN
+
+statement error division by zero
+SELECT 1 / 0
+
+statement error current transaction is aborted
+SELECT 1
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE tmp (x INT)
+
+statement ok
+INSERT INTO tmp VALUES (1)
+
+statement ok
+ROLLBACK
+
+statement error relation "tmp" does not exist
+SELECT * FROM tmp
+
+statement ok
+CREATE TABLE s (a VARCHAR(3), b INT)
+
+statement ok
+INSERT INTO s VALUES ('ab  ', 2.6::float8)
+
+statement error value too long for type character varying(3)
+INSERT INTO s VALUES ('abcd', 1)
+
+statement error column "b" is of type integer but expression is of type boolean
+INSERT INTO s (b) VALUES (true)
+
+statement error INSERT has more expressions than target columns
+INSERT INTO s VALUES ('a', 1, 2)
+
+query TI
+SELECT a || '|', b FROM s
+----
+ab | 3
+
+statement ok
+DROP INDEX t_v
+
+statement ok
+DROP TABLE t, s
+
+statement error table "t" does not exist
+DROP TABLE t
+
+statement ok
+DROP TABLE IF EXISTS t
+

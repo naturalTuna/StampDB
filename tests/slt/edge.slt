@@ -1,0 +1,260 @@
+statement ok
+CREATE TABLE n (i INT, b BIGINT, f FLOAT8, s TEXT, v VARCHAR(5))
+
+statement ok
+INSERT INTO n VALUES (1, 1, 1, 'a', 'a'), (2, 3000000000, 2.5, 'b', 'bb'), (NULL, NULL, 'NaN', NULL, NULL), (-1, -1, -0.0, 'é', 'z'), (0, 0, 0, '', ''), (3, 3, 'Infinity', 'B', 'b')
+
+query IRT
+SELECT i + b, f * 2, s || '.' FROM n ORDER BY i
+----
+-2 0 é.
+0 0 .
+2 2 a.
+3000000002 5 b.
+6 Infinity B.
+NULL NaN NULL
+
+query T
+SELECT 2147483647::int8 + 1 > 2147483647
+----
+t
+
+query TTT
+SELECT 1 = 1.0::float8, 1 < 1.5, 2 > 1.5
+----
+t t t
+
+query I
+SELECT i FROM n WHERE i > 0.5 ORDER BY i
+----
+1
+2
+3
+
+query R
+SELECT f FROM n ORDER BY f
+----
+0
+0
+1
+2.5
+Infinity
+NaN
+
+query R
+SELECT f FROM n ORDER BY f DESC
+----
+NaN
+Infinity
+2.5
+1
+0
+0
+
+query I
+SELECT count(*) FROM n WHERE f = 'NaN'::float8
+----
+1
+
+query T
+SELECT s FROM n ORDER BY s
+----
+(empty)
+B
+a
+b
+é
+NULL
+
+query T
+SELECT v FROM n WHERE v < 'b' ORDER BY v
+----
+(empty)
+a
+
+query IR
+SELECT count(DISTINCT f), sum(f) FROM n WHERE f < 3
+----
+3 3.5
+
+query TI
+SELECT length(s), count(*) FROM n GROUP BY length(s) ORDER BY 1
+----
+0 1
+1 4
+NULL 1
+
+query T
+SELECT s FROM n WHERE s IS NOT NULL ORDER BY length(s) DESC, s
+----
+B
+a
+b
+é
+(empty)
+
+query I
+SELECT count(*) FROM n HAVING count(*) > 100
+----
+
+query I
+SELECT count(*) FROM n WHERE false
+----
+0
+
+query II rowsort
+VALUES (1, 2), (3, 4)
+----
+1 2
+3 4
+
+query I
+SELECT 1 WHERE false
+----
+
+statement ok
+CREATE TABLE m (k BIGINT, g FLOAT8, w VARCHAR(10))
+
+statement ok
+INSERT INTO m VALUES (1, 0, 'a'), (3000000000, -0.0, 'bb'), (NULL, 'NaN', NULL), (3, 'NaN', 'b')
+
+query IIR rowsort
+SELECT n.i, m.k, m.g FROM n JOIN m ON n.b = m.k
+----
+1 1 0
+2 3000000000 0
+3 3 NaN
+
+query RR rowsort
+SELECT n.f, m.g FROM n JOIN m ON n.f = m.g
+----
+0 0
+0 0
+0 0
+0 0
+NaN NaN
+NaN NaN
+
+query TT rowsort
+SELECT n.s, m.w FROM n JOIN m ON n.v = m.w
+----
+B b
+a a
+b bb
+
+query II rowsort
+SELECT n.i, m.k FROM n LEFT JOIN m ON n.i = m.k
+----
+-1 NULL
+0 NULL
+1 1
+2 NULL
+3 3
+NULL NULL
+
+query I
+SELECT count(*) FROM n LEFT JOIN m ON n.i = m.k AND n.i > 1
+----
+6
+
+query II rowsort
+SELECT n.i, m.k FROM n LEFT JOIN m ON n.i = m.k AND n.i > 1 WHERE n.i < 2
+----
+-1 NULL
+0 NULL
+1 NULL
+
+statement ok
+CREATE INDEX n_f ON n (f)
+
+statement ok
+CREATE INDEX n_iv ON n (i, v)
+
+query R
+SELECT f FROM n WHERE f > 1 ORDER BY f
+----
+2.5
+Infinity
+NaN
+
+query R
+SELECT f FROM n WHERE f = 0 ORDER BY f
+----
+0
+0
+
+query R
+SELECT f FROM n WHERE f >= 'NaN'::float8
+----
+NaN
+
+query IT
+SELECT i, v FROM n WHERE i < 2 ORDER BY i
+----
+-1 z
+0 (empty)
+1 a
+
+query IT
+SELECT i, v FROM n WHERE i = 2 AND v > 'a'
+----
+2 bb
+
+query IT
+SELECT i, v FROM n WHERE i = 0 AND v = ''
+----
+0 (empty)
+
+query I
+SELECT i FROM n WHERE i >= 3000000000
+----
+
+statement ok
+UPDATE n SET f = NULL WHERE f > 2
+
+query I
+SELECT count(*) FROM n WHERE f IS NULL
+----
+3
+
+statement ok
+UPDATE n SET i = i * 10 WHERE i > 0
+
+query IR
+SELECT i, f FROM n ORDER BY i NULLS FIRST
+----
+NULL NULL
+-1 0
+0 0
+10 1
+20 NULL
+30 NULL
+
+statement ok
+DELETE FROM n WHERE i < 10 OR i IS NULL
+
+query I
+SELECT i FROM n ORDER BY i
+----
+10
+20
+30
+
+query TI
+SELECT 'x', count(*) FROM m
+----
+x 4
+
+query TI
+SELECT w, count(*) FROM m GROUP BY w ORDER BY w NULLS FIRST
+----
+NULL 1
+a 1
+b 1
+bb 1
+
+query I
+SELECT k FROM m ORDER BY k LIMIT 1
+----
+1
+

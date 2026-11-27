@@ -1,0 +1,174 @@
+statement ok
+CREATE TABLE items (id INT, name TEXT, price FLOAT8, qty INT, tag VARCHAR(10))
+
+statement ok
+INSERT INTO items VALUES (1, 'apple', 1.25, 10, 'fruit'), (2, 'banana', 0.5, 25, 'fruit'), (3, 'carrot', 0.75, NULL, 'veg'), (4, 'durian', 12.5, 1, NULL), (5, 'eggplant', NULL, 4, 'veg')
+
+statement ok
+INSERT INTO items (id, name) VALUES (6, 'fig')
+
+query ITRIT
+SELECT * FROM items ORDER BY id
+----
+1 apple 1.25 10 fruit
+2 banana 0.5 25 fruit
+3 carrot 0.75 NULL veg
+4 durian 12.5 1 NULL
+5 eggplant NULL 4 veg
+6 fig NULL NULL NULL
+
+query IT rowsort
+SELECT id, name FROM items WHERE price > 0.6
+----
+1 apple
+3 carrot
+4 durian
+
+query IT
+SELECT id, name FROM items WHERE qty IS NULL ORDER BY id
+----
+3 carrot
+6 fig
+
+query T
+SELECT name FROM items WHERE tag = 'veg' AND qty > 2
+----
+eggplant
+
+query T
+SELECT name FROM items WHERE tag = 'fruit' OR price IS NULL ORDER BY name DESC
+----
+fig
+eggplant
+banana
+apple
+
+query TR
+SELECT name, price * qty AS total FROM items ORDER BY total DESC NULLS LAST, name
+----
+apple 12.5
+banana 12.5
+durian 12.5
+carrot NULL
+eggplant NULL
+fig NULL
+
+query IR
+SELECT id, price FROM items ORDER BY price, id
+----
+2 0.5
+3 0.75
+1 1.25
+4 12.5
+5 NULL
+6 NULL
+
+query IR
+SELECT id, price FROM items ORDER BY price DESC, id
+----
+5 NULL
+6 NULL
+4 12.5
+1 1.25
+3 0.75
+2 0.5
+
+query IR
+SELECT id, price FROM items ORDER BY price ASC NULLS FIRST, id
+----
+5 NULL
+6 NULL
+2 0.5
+3 0.75
+1 1.25
+4 12.5
+
+query T
+SELECT name FROM items ORDER BY 1 LIMIT 3
+----
+apple
+banana
+carrot
+
+query T
+SELECT name FROM items ORDER BY id LIMIT 2 OFFSET 3
+----
+durian
+eggplant
+
+query T
+SELECT name FROM items ORDER BY id OFFSET 5
+----
+fig
+
+query T
+SELECT name FROM items ORDER BY id LIMIT 0
+----
+
+query T
+SELECT DISTINCT tag FROM items ORDER BY tag
+----
+fruit
+veg
+NULL
+
+query IT
+SELECT qty / 2, upper(tag) FROM items WHERE id <= 3 ORDER BY id
+----
+5 FRUIT
+12 FRUIT
+NULL VEG
+
+query I
+SELECT id FROM items WHERE name LIKE '%a%a%' ORDER BY id
+----
+2
+
+query I
+SELECT id FROM items WHERE id IN (2, 4, 7) ORDER BY id
+----
+2
+4
+
+query I
+SELECT id FROM items WHERE NOT (qty > 5) ORDER BY id
+----
+4
+5
+
+query T
+SELECT name FROM items i WHERE i.id = 3
+----
+carrot
+
+query IT
+SELECT id + 1 AS next, name FROM items ORDER BY next DESC LIMIT 2
+----
+7 fig
+6 eggplant
+
+query I
+SELECT id FROM items ORDER BY qty * -1, id
+----
+2
+1
+5
+4
+3
+6
+
+statement error column "nope" does not exist
+SELECT nope FROM items
+
+statement error relation "missing" does not exist
+SELECT * FROM missing
+
+statement error argument of WHERE must be type boolean
+SELECT * FROM items WHERE qty
+
+statement error LIMIT must not be negative
+SELECT * FROM items LIMIT -1
+
+statement error ORDER BY position 9 is not in select list
+SELECT id FROM items ORDER BY 9
+

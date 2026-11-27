@@ -1,0 +1,92 @@
+statement ok
+CREATE TABLE sales (region TEXT, product TEXT, units INT, amount FLOAT8)
+
+statement ok
+INSERT INTO sales VALUES ('east', 'a', 10, 100.5), ('east', 'b', 5, 20), ('west', 'a', 7, 70.25), ('west', 'a', 3, NULL), ('north', 'c', NULL, 5), (NULL, 'a', 1, 1)
+
+query IIIRR
+SELECT count(*), count(units), sum(units), sum(amount), avg(amount) FROM sales
+----
+6 5 26 196.75 39.35
+
+query ITTRR
+SELECT min(units), min(region), max(product), max(amount), min(amount) FROM sales
+----
+1 east c 100.5 1
+
+query TII rowsort
+SELECT region, count(*), sum(units) FROM sales GROUP BY region
+----
+NULL 1 1
+east 2 15
+north 1 NULL
+west 2 10
+
+query TTI
+SELECT region, product, sum(units) FROM sales GROUP BY region, product ORDER BY region, product
+----
+east a 10
+east b 5
+north c NULL
+west a 10
+NULL a 1
+
+query TI
+SELECT region, sum(units) AS total FROM sales GROUP BY region HAVING sum(units) > 5 ORDER BY total DESC
+----
+east 15
+west 10
+
+query TR
+SELECT product, avg(amount) FROM sales GROUP BY 1 ORDER BY 1
+----
+a 57.25
+b 20
+c 5
+
+query II
+SELECT count(DISTINCT product), count(DISTINCT region) FROM sales
+----
+3 3
+
+query IIT
+SELECT count(*), sum(units), max(region) FROM sales WHERE units > 100
+----
+0 NULL NULL
+
+query T
+SELECT region FROM sales GROUP BY region ORDER BY count(*) DESC, region LIMIT 2
+----
+east
+west
+
+query TI
+SELECT upper(region) AS r, units / 2 AS h FROM sales GROUP BY region, units ORDER BY r, h
+----
+EAST 2
+EAST 5
+NORTH NULL
+WEST 1
+WEST 3
+NULL 0
+
+query I
+SELECT sum(units) * 2 + count(*) FROM sales
+----
+58
+
+query T rowsort
+SELECT product FROM sales GROUP BY product HAVING count(*) = 1
+----
+b
+c
+
+statement error must appear in the GROUP BY clause or be used in an aggregate function
+SELECT region, units FROM sales GROUP BY region
+
+statement error aggregate functions are not allowed in WHERE
+SELECT region FROM sales WHERE sum(units) > 1
+
+statement error aggregate function calls cannot be nested
+SELECT sum(count(*)) FROM sales
+

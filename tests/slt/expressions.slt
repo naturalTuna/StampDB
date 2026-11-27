@@ -1,0 +1,145 @@
+query IITIT
+SELECT 1, -2147483648, 2147483648, 7 / 2, 'abc'
+----
+1 -2147483648 2147483648 3 abc
+
+query III
+SELECT -7 / 2, -7 % 2, 7 % -2
+----
+-3 -1 1
+
+query RRRR
+SELECT 1.5::float8 * 2, 1::float8 / 3, 0.1::float8 + 0.2, 1e15::float8
+----
+3 0.3333333333333333 0.30000000000000004 1e+15
+
+query RRR
+SELECT 1e-5::float8, 123456789012345::float8, -0.0::float8
+----
+1e-05 123456789012345 -0
+
+query RRR
+SELECT 'Infinity'::float8, '-inf'::float8 + 1, 'NaN'::float8
+----
+Infinity -Infinity NaN
+
+query TTTT
+SELECT true, false, 't'::bool, NOT true
+----
+t f t f
+
+query TTTT
+SELECT NULL = NULL, NULL IS NULL, 1 IS NOT NULL, NULL::int IS NULL
+----
+NULL t t t
+
+query TTTTT
+SELECT NULL AND false, NULL AND true, NULL OR true, NULL OR false, true AND true
+----
+f NULL t NULL t
+
+query TTTT
+SELECT 1 IN (1, 2), 3 IN (1, 2), 3 IN (1, NULL), 3 NOT IN (1, 2)
+----
+t f NULL t
+
+query TTT
+SELECT 2 BETWEEN 1 AND 3, 5 NOT BETWEEN 1 AND 3, NULL BETWEEN 1 AND 3
+----
+t t NULL
+
+query TTTT
+SELECT 'a' < 'b', 'B' < 'a', 'abc' < 'abd', '' < 'a'
+----
+t t t t
+
+query TTTT
+SELECT 'hello' LIKE 'h%o', 'hello' LIKE 'H%', 'hello' ILIKE 'H%', 'h_llo' LIKE 'h\_llo'
+----
+t f t t
+
+query TTT
+SELECT 'ab' || 'cd', 'n' || 1, 1 || 'n'
+----
+abcd n1 1n
+
+query ITTI
+SELECT length('héllo'), upper('abc'), lower('ÀBC'), abs(-5)
+----
+5 ABC Àbc 5
+
+query TIT
+SELECT CASE WHEN 1 > 2 THEN 'x' WHEN 2 > 1 THEN 'y' END, CASE 3 WHEN 1 THEN 10 WHEN 3 THEN 30 ELSE 0 END, CASE WHEN false THEN 'z' END
+----
+y 30 NULL
+
+query IIT
+SELECT COALESCE(NULL, NULL, 3), NULLIF(4, 4), COALESCE(NULL, 'x')
+----
+3 NULL x
+
+query ITTR
+SELECT '12'::int, 12::text, 3.7::float8::int, 2.5::float8::int
+----
+12 12 4 2
+
+query TTT
+SELECT true::text, 'yes'::bool, 1::bool
+----
+true t t
+
+query TT
+SELECT 'abcdef'::varchar(3), CAST(42 AS varchar(1))
+----
+abc 4
+
+query TTT
+SELECT TIMESTAMP '2024-02-29 12:34:56.789', '2000-01-01'::timestamp, '1999-12-31 23:59:59.999999'::timestamp
+----
+2024-02-29 12:34:56.789 2000-01-01 00:00:00 1999-12-31 23:59:59.999999
+
+query TT
+SELECT TIMESTAMP '2024-01-01' < TIMESTAMP '2024-01-02', '2024-01-01 00:00:00.0000005'::timestamp = '2024-01-01'::timestamp
+----
+t t
+
+query TTTT
+SELECT 1 IS DISTINCT FROM NULL, NULL IS DISTINCT FROM NULL, 1 IS NOT DISTINCT FROM 1, (1 = NULL) IS UNKNOWN
+----
+t f t t
+
+query TTT
+SELECT (NULL::bool) IS TRUE, (NULL::bool) IS NOT FALSE, (1 < 2) IS TRUE
+----
+f t t
+
+statement error division by zero
+SELECT 1 / 0
+
+statement error division by zero
+SELECT 1 % 0
+
+statement error integer out of range
+SELECT 2147483647 + 1
+
+statement error bigint out of range
+SELECT 9223372036854775807::int8 * 2
+
+statement error integer out of range
+SELECT (-2147483648)::int4 * -1
+
+statement error invalid input syntax for type integer
+SELECT 'abc'::int
+
+statement error operator does not exist
+SELECT 1 = 'a'::text
+
+statement error value out of range: overflow
+SELECT 1e300::float8 * 1e300::float8
+
+statement error date/time field value out of range
+SELECT '2023-02-29'::timestamp
+
+statement error invalid input syntax for type boolean
+SELECT 'maybe'::bool
+
