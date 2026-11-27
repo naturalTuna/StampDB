@@ -4,6 +4,7 @@ pub mod access;
 pub mod buffer;
 pub mod catalog;
 pub mod lock;
+pub mod sql;
 pub mod storage;
 pub mod txn;
 pub mod types;
