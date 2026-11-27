@@ -1,0 +1,127 @@
+statement ok
+CREATE TABLE dept (id INT PRIMARY KEY, code TEXT UNIQUE, name TEXT)
+
+statement ok
+CREATE TABLE emp (id INT PRIMARY KEY, dept_id INT REFERENCES dept, dept_code TEXT, boss INT REFERENCES emp (id), FOREIGN KEY (dept_code) REFERENCES dept (code) ON DELETE RESTRICT)
+
+statement ok
+INSERT INTO dept VALUES (1, 'eng', 'Engineering'), (2, 'ops', 'Operations'), (3, 'hr', 'People')
+
+statement ok
+INSERT INTO emp VALUES (10, 1, 'eng', NULL), (11, 1, 'eng', 10), (12, 2, NULL, 10), (13, NULL, NULL, NULL)
+
+statement error insert or update on table "emp" violates foreign key constraint "emp_dept_id_fkey"
+INSERT INTO emp VALUES (14, 9, NULL, NULL)
+
+statement error insert or update on table "emp" violates foreign key constraint "emp_dept_code_fkey"
+INSERT INTO emp VALUES (14, 1, 'xyz', NULL)
+
+statement error insert or update on table "emp" violates foreign key constraint "emp_boss_fkey"
+INSERT INTO emp VALUES (14, 1, NULL, 99)
+
+statement ok
+INSERT INTO emp VALUES (14, 3, 'hr', 14)
+
+statement error insert or update on table "emp" violates foreign key constraint "emp_dept_id_fkey"
+UPDATE emp SET dept_id = 7 WHERE id = 12
+
+statement ok
+UPDATE emp SET dept_id = 3 WHERE id = 12
+
+statement error update or delete on table "dept" violates foreign key constraint "emp_dept_id_fkey" on table "emp"
+DELETE FROM dept WHERE id = 1
+
+statement error update or delete on table "dept" violates foreign key constraint "emp_dept_id_fkey" on table "emp"
+UPDATE dept SET id = 100 WHERE id = 1
+
+statement ok
+UPDATE dept SET name = 'Eng' WHERE id = 1
+
+statement ok
+DELETE FROM dept WHERE id = 2
+
+statement error update or delete on table "dept" violates foreign key constraint "emp_dept_code_fkey" on table "emp"
+UPDATE dept SET code = 'e' WHERE id = 1
+
+statement error update or delete on table "emp" violates foreign key constraint "emp_boss_fkey" on table "emp"
+DELETE FROM emp WHERE id = 10
+
+statement ok
+DELETE FROM emp WHERE id = 14
+
+statement ok
+DELETE FROM emp WHERE boss = 10
+
+statement ok
+DELETE FROM emp WHERE id = 10
+
+query IITI
+SELECT * FROM emp ORDER BY id
+----
+13 NULL NULL NULL
+
+query ITT
+SELECT * FROM dept ORDER BY id
+----
+1 eng Eng
+3 hr People
+
+statement error cannot drop table dept because other objects depend on it
+DROP TABLE dept
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO dept VALUES (5, 'new', 'New')
+
+statement ok
+INSERT INTO emp VALUES (20, 5, 'new', NULL)
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM emp WHERE id = 20
+----
+0
+
+statement ok
+CREATE TABLE pair (a INT, b TEXT, PRIMARY KEY (a, b))
+
+statement ok
+CREATE TABLE ref2 (x TEXT, y BIGINT, CONSTRAINT r2 FOREIGN KEY (x, y) REFERENCES pair (b, a))
+
+statement ok
+INSERT INTO pair VALUES (1, 'one'), (2, 'two')
+
+statement ok
+INSERT INTO ref2 VALUES ('one', 1), ('two', NULL), (NULL, 77)
+
+statement error insert or update on table "ref2" violates foreign key constraint "r2"
+INSERT INTO ref2 VALUES ('one', 2)
+
+statement error update or delete on table "pair" violates foreign key constraint "r2" on table "ref2"
+DELETE FROM pair WHERE a = 1
+
+statement ok
+DELETE FROM pair WHERE a = 2
+
+statement error there is no unique constraint matching given keys for referenced table "dept"
+CREATE TABLE bad (n TEXT REFERENCES dept (name))
+
+statement error number of referencing and referenced columns for foreign key disagree
+CREATE TABLE bad (a INT, FOREIGN KEY (a) REFERENCES pair (a, b))
+
+statement error foreign key constraint "bad_a_fkey" cannot be implemented
+CREATE TABLE bad (a TEXT REFERENCES dept)
+
+statement error relation "nope" does not exist
+CREATE TABLE bad (a INT REFERENCES nope)
+
+statement ok
+DROP TABLE ref2
+
+statement ok
+DROP TABLE pair
+

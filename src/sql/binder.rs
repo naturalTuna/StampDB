@@ -11,7 +11,7 @@ use super::datum::parse_value;
 use super::error::{Result, SqlError, code};
 use super::expr::{BinOp, CastMode, Expr, Func, cast};
 use super::plan::{AggCall, AggFunc, JoinKind, OutCol, Plan, SortKey};
-use crate::catalog::{Catalog, Column, RelKind, RelationInfo};
+use crate::catalog::{Catalog, Column, FkAction, RelKind, RelationInfo};
 use crate::lock::LockMode;
 use crate::storage::backend::RelFileId;
 use crate::txn::{Isolation, Transaction};
@@ -46,6 +46,7 @@ pub enum Bound {
     Delete {
         table: RelationInfo,
         scan: Plan,
+        rules: Rules,
     },
 }
 
@@ -96,6 +97,14 @@ pub enum ConstraintDef {
         name: Option<String>,
         expr: Box<ast::Expr>,
     },
+    ForeignKey {
+        name: Option<String>,
+        columns: Vec<String>,
+        parent: String,
+        parent_columns: Option<Vec<String>>,
+        on_delete: FkAction,
+        on_update: FkAction,
+    },
 }
 
 /// Row rules checked before a row is stored (PostgreSQL's
@@ -104,6 +113,10 @@ pub enum ConstraintDef {
 pub struct Rules {
     pub not_null: Vec<usize>,
     pub checks: Vec<(String, Expr)>,
+    /// Foreign keys of this table.
+    pub fk_out: Vec<super::ri::FkOut>,
+    /// Foreign keys referencing this table.
+    pub fk_in: Vec<super::ri::FkIn>,
 }
 
 /// Classified statement.
@@ -324,6 +337,47 @@ fn pk_def(
     })
 }
 
+fn fk_action(a: Option<ast::ReferentialAction>) -> FkAction {
+    match a {
+        None | Some(ast::ReferentialAction::NoAction) => FkAction::NoAction,
+        Some(ast::ReferentialAction::Restrict) => FkAction::Restrict,
+        Some(ast::ReferentialAction::Cascade) => FkAction::Cascade,
+        Some(ast::ReferentialAction::SetNull) => FkAction::SetNull,
+        Some(ast::ReferentialAction::SetDefault) => FkAction::SetDefault,
+    }
+}
+
+/// A FOREIGN KEY or REFERENCES clause; `column` is set for the column
+/// form (its own column).
+fn fk_def(
+    f: &ast::ForeignKeyConstraint,
+    name: Option<String>,
+    column: Option<String>,
+) -> Result<ConstraintDef> {
+    if f.index_name.is_some()
+        || f.characteristics.is_some()
+        || !matches!(
+            f.match_kind,
+            None | Some(ast::ConstraintReferenceMatchKind::Simple)
+        )
+    {
+        return Err(SqlError::unsupported(format!("{f}")));
+    }
+    let columns = match column {
+        Some(c) => vec![c],
+        None => f.columns.iter().map(ident).collect(),
+    };
+    Ok(ConstraintDef::ForeignKey {
+        name: name.or_else(|| f.name.as_ref().map(ident)),
+        columns,
+        parent: object_name(&f.foreign_table)?,
+        parent_columns: (!f.referred_columns.is_empty())
+            .then(|| f.referred_columns.iter().map(ident).collect()),
+        on_delete: fk_action(f.on_delete),
+        on_update: fk_action(f.on_update),
+    })
+}
+
 fn check_def(c: &ast::CheckConstraint, name: Option<String>) -> Result<ConstraintDef> {
     if c.no_inherit || c.enforced == Some(false) {
         return Err(SqlError::unsupported(format!("{c}")));
@@ -363,6 +417,7 @@ fn column_def(c: &ast::ColumnDef, table: &str, out: &mut Vec<ConstraintDef>) -> 
             ast::ColumnOption::PrimaryKey(p) => out.push(pk_def(p, cname, vec![name.clone()])?),
             ast::ColumnOption::Unique(u) => out.push(unique_def(u, cname, vec![name.clone()])?),
             ast::ColumnOption::Check(ch) => out.push(check_def(ch, cname)?),
+            ast::ColumnOption::ForeignKey(f) => out.push(fk_def(f, cname, Some(name.clone()))?),
             other => {
                 return Err(SqlError::unsupported(format!("column option {other}")));
             }
@@ -434,6 +489,7 @@ pub fn classify(stmt: &ast::Statement) -> Result<Kind<'_>> {
                         unique_def(u, None, key_columns(&u.columns)?)?
                     }
                     ast::TableConstraint::Check(c) => check_def(c, None)?,
+                    ast::TableConstraint::ForeignKey(f) => fk_def(f, None, None)?,
                     other => return Err(SqlError::unsupported(format!("constraint {other}"))),
                 });
             }
@@ -1379,7 +1435,7 @@ impl<'a> Binder<'a> {
             t
         };
         let defaults = self.defaults(&table)?;
-        let rules = self.rules(&table)?;
+        let rules = self.table_rules(&table)?;
         let Some(src) = &i.source else {
             // INSERT ... DEFAULT VALUES
             return Ok(Bound::Insert {
@@ -1509,8 +1565,9 @@ impl<'a> Binder<'a> {
             .collect()
     }
 
-    /// NOT NULL columns and bound CHECK constraints of `table`.
-    fn rules(&mut self, table: &RelationInfo) -> Result<Rules> {
+    /// NOT NULL columns, bound CHECK constraints, and foreign keys of
+    /// `table` (locking the other tables of its foreign keys).
+    pub fn table_rules(&mut self, table: &RelationInfo) -> Result<Rules> {
         let mut checks = Vec::new();
         for c in self.cat.constraints_of(self.txn, table.oid)? {
             if let Some(text) = &c.check {
@@ -1519,7 +1576,10 @@ impl<'a> Binder<'a> {
             }
         }
         checks.sort_by(|a, b| a.0.cmp(&b.0));
+        let (fk_out, fk_in) = super::ri::foreign_keys(self.cat, self.txn, table)?;
         Ok(Rules {
+            fk_out,
+            fk_in,
             not_null: (0..table.columns.len())
                 .filter(|&i| table.columns[i].not_null)
                 .collect(),
@@ -1661,7 +1721,7 @@ impl<'a> Binder<'a> {
             Some(w) => Some(self.bind_bool(w, &scope, Clause::Where)?),
             None => None,
         };
-        let rules = self.rules(&table)?;
+        let rules = self.table_rules(&table)?;
         Ok(Bound::Update {
             scan: Plan::Scan {
                 table: table.clone(),
@@ -1699,12 +1759,14 @@ impl<'a> Binder<'a> {
             Some(w) => Some(self.bind_bool(w, &scope, Clause::Where)?),
             None => None,
         };
+        let rules = self.table_rules(&table)?;
         Ok(Bound::Delete {
             scan: Plan::Scan {
                 table: table.clone(),
                 filter,
             },
             table,
+            rules,
         })
     }
 

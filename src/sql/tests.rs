@@ -447,7 +447,7 @@ fn ddl_statements() {
         code::FEATURE_NOT_SUPPORTED
     );
     assert_eq!(
-        fails(&mut s, "CREATE TABLE d (a INT REFERENCES t (a))").code,
+        fails(&mut s, "CREATE TEMPORARY TABLE d (a INT)").code,
         code::FEATURE_NOT_SUPPORTED
     );
     ok(&mut s, "INSERT INTO t VALUES (1, 'x'), (2, 'x')");
@@ -887,4 +887,90 @@ fn constraints_apply_to_rows_recomputed_after_concurrent_updates() {
         fails(&mut a, "INSERT INTO acct VALUES (NULL, 0)").code,
         code::NOT_NULL_VIOLATION
     );
+}
+
+fn fk_db() -> (Arc<Database>, Session, Session) {
+    let db = db();
+    let mut a = db.session();
+    let b = db.session();
+    ok(&mut a, "CREATE TABLE p (id INT PRIMARY KEY, name TEXT)");
+    ok(&mut a, "CREATE TABLE c (id INT, pid INT REFERENCES p)");
+    ok(&mut a, "INSERT INTO p VALUES (1, 'one'), (2, 'two')");
+    (db, a, b)
+}
+
+#[test]
+fn foreign_keys_wait_on_key_locks() {
+    let (_db, mut a, mut b) = fk_db();
+    // A child insert waits for a parent delete; it fails if that commits.
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "DELETE FROM p WHERE id = 1");
+    let (_, r) = blocked(&mut b, "INSERT INTO c VALUES (1, 1)", || {
+        ok(&mut a, "COMMIT")
+    });
+    assert_eq!(r.unwrap_err().code, code::FOREIGN_KEY_VIOLATION);
+    // ... and succeeds if it rolls back.
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "DELETE FROM p WHERE id = 2");
+    let (_, r) = blocked(&mut b, "INSERT INTO c VALUES (2, 2)", || {
+        ok(&mut a, "ROLLBACK")
+    });
+    assert_eq!(r.unwrap()[0].tag, "INSERT 0 1");
+
+    // A parent delete waits for a child that share-locked the key.
+    ok(&mut a, "INSERT INTO p VALUES (3, 'three'), (4, 'four')");
+    ok(&mut b, "BEGIN");
+    ok(&mut b, "INSERT INTO c VALUES (3, 3)");
+    let (_, r) = blocked(&mut a, "DELETE FROM p WHERE id = 3", || {
+        ok(&mut b, "COMMIT")
+    });
+    assert_eq!(r.unwrap_err().code, code::FOREIGN_KEY_VIOLATION);
+    ok(&mut b, "BEGIN");
+    ok(&mut b, "INSERT INTO c VALUES (4, 4)");
+    let (_, r) = blocked(&mut a, "DELETE FROM p WHERE id = 4", || {
+        ok(&mut b, "ROLLBACK")
+    });
+    assert_eq!(r.unwrap()[0].tag, "DELETE 1");
+
+    // Updating other columns of the parent does not block children.
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "UPDATE p SET name = 'TWO' WHERE id = 2");
+    ok(&mut b, "INSERT INTO c VALUES (5, 2)");
+    ok(&mut a, "COMMIT");
+    assert_eq!(
+        q(&mut a, "SELECT count(*) FROM c WHERE pid = 2"),
+        rows(&[&["2"]])
+    );
+}
+
+#[test]
+fn foreign_keys_under_snapshot_isolation() {
+    let (_db, mut a, mut b) = fk_db();
+    // The parent the snapshot saw was deleted since: serialization failure.
+    ok(&mut b, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    q(&mut b, "SELECT count(*) FROM p");
+    ok(&mut a, "DELETE FROM p WHERE id = 1");
+    assert_eq!(
+        fails(&mut b, "INSERT INTO c VALUES (1, 1)").code,
+        code::SERIALIZATION_FAILURE
+    );
+    ok(&mut b, "ROLLBACK");
+    // A parent inserted after the snapshot does not count.
+    ok(&mut b, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    q(&mut b, "SELECT count(*) FROM p");
+    ok(&mut a, "INSERT INTO p VALUES (7, 'seven')");
+    assert_eq!(
+        fails(&mut b, "INSERT INTO c VALUES (7, 7)").code,
+        code::FOREIGN_KEY_VIOLATION
+    );
+    ok(&mut b, "ROLLBACK");
+    // A child committed after the snapshot blocks deleting its parent.
+    ok(&mut b, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    q(&mut b, "SELECT count(*) FROM p");
+    ok(&mut a, "INSERT INTO c VALUES (1, 2)");
+    assert_eq!(
+        fails(&mut b, "DELETE FROM p WHERE id = 2").code,
+        code::SERIALIZATION_FAILURE
+    );
+    ok(&mut b, "ROLLBACK");
 }

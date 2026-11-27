@@ -100,6 +100,12 @@ impl From<LockError> for SqlError {
     }
 }
 
+impl From<crate::txn::TxnError> for SqlError {
+    fn from(e: crate::txn::TxnError) -> Self {
+        Self::internal(e)
+    }
+}
+
 impl From<TransactionError> for SqlError {
     fn from(e: TransactionError) -> Self {
         match e {

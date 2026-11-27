@@ -10,7 +10,9 @@ pub mod binder;
 pub mod exec;
 pub mod plan;
 pub mod planner;
+pub mod ri;
 pub mod session;
+pub mod writer;
 
 #[cfg(test)]
 mod tests;

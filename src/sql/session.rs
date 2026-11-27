@@ -16,8 +16,9 @@ use super::exec::{self, ExecEnv};
 use super::expr::{Expr, is_true};
 use super::plan::{OutCol, Plan};
 use super::planner;
+use super::writer::Writer;
 use crate::access::heap::{HeapFile, TmResult};
-use crate::access::tuple::{deform_tuple, form_tuple};
+use crate::access::tuple::deform_tuple;
 use crate::access::visibility::Me;
 use crate::catalog::{Catalog, Column, ConstraintKind, NewConstraint, RelKind, RelationInfo};
 use crate::lock::{LockManager, WaitPolicy};
@@ -410,7 +411,8 @@ impl Session {
             .filter_map(|d| match d {
                 ConstraintDef::PrimaryKey { name, .. }
                 | ConstraintDef::Unique { name, .. }
-                | ConstraintDef::Check { name, .. } => name.clone(),
+                | ConstraintDef::Check { name, .. }
+                | ConstraintDef::ForeignKey { name, .. } => name.clone(),
             })
             .collect();
         for (i, n) in taken.iter().enumerate() {
@@ -429,6 +431,42 @@ impl Session {
                 }
                 ConstraintDef::Unique { name, columns } => {
                     (name.clone(), ConstraintKind::Unique(columns.clone()))
+                }
+                ConstraintDef::ForeignKey {
+                    name,
+                    columns,
+                    parent,
+                    parent_columns,
+                    on_delete,
+                    on_update,
+                } => {
+                    if parent != table
+                        && let Some(p) = cat.lookup_relation(txn, parent)?
+                    {
+                        check_user_relation(p.oid, parent)?;
+                    }
+                    let base = format!("{table}_{}_fkey", columns.join("_"));
+                    let name = name.clone().unwrap_or_else(|| {
+                        let mut n = base.clone();
+                        let mut k = 0;
+                        while taken.contains(&n) {
+                            k += 1;
+                            n = format!("{base}{k}");
+                        }
+                        taken.push(n.clone());
+                        n
+                    });
+                    out.push(NewConstraint {
+                        name,
+                        kind: ConstraintKind::ForeignKey {
+                            columns: columns.clone(),
+                            parent: parent.clone(),
+                            parent_columns: parent_columns.clone(),
+                            on_delete: *on_delete,
+                            on_update: *on_update,
+                        },
+                    });
+                    continue;
                 }
                 ConstraintDef::Check { name, expr } => {
                     let bound = Binder::new(cat, txn).bind_check(table, columns, expr)?;
@@ -526,18 +564,10 @@ impl Session {
                 let plan = self.optimize(txn, source)?;
                 let env = self.env(txn);
                 let rows = exec::run(&plan, &env)?;
-                let cat = &self.db.catalog;
-                let heap = HeapFile::open(table.rel, self.db.engine().pool().clone())?;
-                let indexes = cat.table_indexes(txn, &table)?;
-                let desc = table.desc();
+                let mut w = Writer::new(&self.db.catalog);
+                let tw = w.table(txn, &table, Some(rules))?;
                 for row in &rows {
-                    check_row(&table, &rules, row)?;
-                    let xid = txn.write_xid()?;
-                    let t = form_tuple(&desc, row, xid, txn.command_id())?;
-                    let tid = heap.insert(&t)?;
-                    for (idx, tree) in &indexes {
-                        cat.insert_entry(txn, &table, idx, tree, &heap, row, tid)?;
-                    }
+                    w.insert(txn, &tw, row)?;
                 }
                 Ok(QueryResult::tag(format!("INSERT 0 {}", rows.len())))
             }
@@ -547,11 +577,11 @@ impl Session {
                 assignments,
                 rules,
             } => {
-                let n = self.modify(txn, &table, scan, Some((&assignments, &rules)))?;
+                let n = self.modify(txn, &table, scan, rules, Some(&assignments))?;
                 Ok(QueryResult::tag(format!("UPDATE {n}")))
             }
-            Bound::Delete { table, scan } => {
-                let n = self.modify(txn, &table, scan, None)?;
+            Bound::Delete { table, scan, rules } => {
+                let n = self.modify(txn, &table, scan, rules, None)?;
                 Ok(QueryResult::tag(format!("DELETE {n}")))
             }
         }
@@ -569,7 +599,8 @@ impl Session {
         txn: &mut Transaction,
         table: &RelationInfo,
         scan: Plan,
-        assignments: Option<(&[(usize, Expr)], &Rules)>,
+        rules: Rules,
+        assignments: Option<&[(usize, Expr)]>,
     ) -> Result<u64> {
         let plan = self.optimize(txn, scan)?;
         let filter = match &plan {
@@ -578,35 +609,23 @@ impl Session {
         };
         let env = self.env(txn);
         let mut rows = exec::table_scan(&plan, &env)?;
-        let cat = &self.db.catalog;
         let heap = HeapFile::open(table.rel, self.db.engine().pool().clone())?;
-        let indexes = match assignments {
-            Some(_) => cat.table_indexes(txn, table)?,
-            None => Vec::new(),
-        };
+        let mut w = Writer::new(&self.db.catalog);
+        let tw = w.table(txn, table, Some(rules))?;
         let desc = table.desc();
         let mut count = 0;
         while let Some((first_tid, first_row)) = rows.next_with_tid()? {
             let (mut tid, mut row) = (first_tid, first_row);
             loop {
                 let result = match assignments {
-                    Some((set, rules)) => {
+                    Some(set) => {
                         let mut new_row = row.clone();
                         for (col, e) in set {
                             new_row[*col] = e.eval(&row)?;
                         }
-                        check_row(table, rules, &new_row)?;
-                        let xid = txn.write_xid()?;
-                        let t = form_tuple(&desc, &new_row, xid, txn.command_id())?;
-                        let r = heap.update_waiting(tid, &t, txn)?;
-                        if let TmResult::Ok(new_tid) = r {
-                            for (idx, tree) in &indexes {
-                                cat.insert_entry(txn, table, idx, tree, &heap, &new_row, new_tid)?;
-                            }
-                        }
-                        r
+                        w.update(txn, &tw, tid, &row, &new_row)?
                     }
-                    None => heap.delete_waiting(tid, txn)?,
+                    None => w.delete(txn, &tw, tid, &row)?,
                 };
                 match result {
                     TmResult::Ok(_) => {
@@ -644,34 +663,6 @@ impl Session {
         }
         Ok(count)
     }
-}
-
-/// NOT NULL and CHECK constraints for a row about to be stored.
-fn check_row(table: &RelationInfo, rules: &Rules, row: &[Value]) -> Result<()> {
-    for &c in &rules.not_null {
-        if row[c].is_null() {
-            return Err(SqlError::new(
-                code::NOT_NULL_VIOLATION,
-                format!(
-                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
-                    table.columns[c].name, table.name
-                ),
-            ));
-        }
-    }
-    for (name, e) in &rules.checks {
-        // Only FALSE fails; NULL passes.
-        if e.eval(row)? == Value::Bool(false) {
-            return Err(SqlError::new(
-                code::CHECK_VIOLATION,
-                format!(
-                    "new row for relation \"{}\" violates check constraint \"{name}\"",
-                    table.name
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn check_user_relation(oid: u32, name: &str) -> Result<()> {
