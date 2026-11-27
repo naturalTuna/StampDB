@@ -48,6 +48,9 @@ pub enum CatalogError {
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
 
+    #[error(transparent)]
+    Vacuum(#[from] crate::vacuum::VacuumError),
+
     #[error("relation \"{0}\" already exists")]
     DuplicateRelation(String),
 
@@ -675,6 +678,30 @@ impl Catalog {
             TmResult::Ok(_) => Ok(()),
             _ => Err(CatalogError::Corrupt("catalog row changed concurrently")),
         }
+    }
+
+    /// Vacuums the system tables and their indexes (dead catalog rows left
+    /// by DROP and by aborted or repeated DDL).
+    pub fn vacuum_system(&self, txn: &mut Transaction) -> Result<crate::vacuum::VacuumStats> {
+        let mut total = crate::vacuum::VacuumStats::default();
+        for (table, heap) in [
+            (SYS_CLASS, &self.class),
+            (SYS_ATTRIBUTE, &self.attribute),
+            (SYS_INDEX, &self.index),
+        ] {
+            let trees: Vec<&BTree> = self
+                .indexes
+                .iter()
+                .filter(|(i, _)| i.table == table)
+                .map(|(_, t)| t)
+                .collect();
+            let s = crate::vacuum::vacuum(heap, &trees, txn)?;
+            total.heap_pages += s.heap_pages;
+            total.tuples_removed += s.tuples_removed;
+            total.index_entries_removed += s.index_entries_removed;
+            total.index_pages_deleted += s.index_pages_deleted;
+        }
+        Ok(total)
     }
 
     /// The relation named `name`, as `txn` sees the catalogs.
