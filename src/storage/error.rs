@@ -33,6 +33,14 @@ pub enum StorageError {
         slot: u16,
         state: crate::storage::slotted::ItemState,
     },
+
+    /// Stored page checksum does not match the page contents.
+    #[error("checksum mismatch in block {block}: stored {stored:#010x}, computed {computed:#010x}")]
+    ChecksumMismatch {
+        block: u32,
+        stored: u32,
+        computed: u32,
+    },
 }
 
 /// Result alias for the storage layer.
