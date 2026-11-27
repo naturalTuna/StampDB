@@ -9,17 +9,15 @@
 use std::fmt;
 
 use super::pool::BufferTag;
-use crate::storage::backend::FenceToken;
+use crate::storage::backend::{FenceSource, FenceToken};
 use crate::storage::page::Lsn;
 
-/// Policy consulted on every page flush.
-pub trait FlushControl: Send + Sync + fmt::Debug {
+/// Policy consulted on every page flush; also supplies the fencing token
+/// passed to the storage backend.
+pub trait FlushControl: FenceSource + fmt::Debug {
     /// Whether the page may be written now. A `false` leaves it dirty; the
     /// replacement sweep then skips it.
     fn may_flush(&self, tag: BufferTag, page_lsn: Lsn) -> bool;
-
-    /// Fencing token to pass to the storage backend.
-    fn fence_token(&self) -> FenceToken;
 }
 
 /// Single install mode: flushes are always allowed, the token is fixed.
@@ -38,7 +36,9 @@ impl FlushControl for SingleModeFlush {
     fn may_flush(&self, _tag: BufferTag, _page_lsn: Lsn) -> bool {
         true
     }
+}
 
+impl FenceSource for SingleModeFlush {
     fn fence_token(&self) -> FenceToken {
         self.fence
     }

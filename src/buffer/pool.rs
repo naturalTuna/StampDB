@@ -566,7 +566,7 @@ fn pick<'g>(
 mod tests {
     use super::*;
     use crate::buffer::control::SingleModeFlush;
-    use crate::storage::backend::{FenceToken, FileKey};
+    use crate::storage::backend::{FenceSource, FenceToken, FileKey};
     use crate::storage::checksum::verify_checksum;
     use crate::storage::mem::MemBackend;
     use crate::storage::page::{Lsn, PageKind};
@@ -596,6 +596,9 @@ mod tests {
         fn may_flush(&self, _tag: BufferTag, _lsn: Lsn) -> bool {
             self.allow.load(Ordering::SeqCst)
         }
+    }
+
+    impl FenceSource for Gate {
         fn fence_token(&self) -> FenceToken {
             self.fence
         }

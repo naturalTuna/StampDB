@@ -7,6 +7,8 @@
 //! Layout under the data directory:
 //! ```text
 //! <root>/rel/<relfileid>   relation data files (no segmenting)
+//! <root>/wal/<TTTTTTTTSSSSSSSSSSSSSSSS>  WAL segments (timeline, segno)
+//! <root>/control           control file
 //! ```
 //!
 //! On open, the logical block size of the device holding `<root>` is read
@@ -28,12 +30,16 @@ use super::backend::{FenceToken, FileKey, StorageBackend, check_io_alignment};
 use super::{Result, StorageError};
 
 const REL_DIR: &str = "rel";
+const WAL_DIR: &str = "wal";
+const CONTROL_FILE: &str = "control";
 const SYSFS_DEV_BLOCK: &str = "/sys/dev/block";
 
 /// Backend storing files in a local directory with Direct I/O.
 #[derive(Debug)]
 pub struct LocalDirBackend {
+    root: PathBuf,
     rel_dir: PathBuf,
+    wal_dir: PathBuf,
     /// Open handles, so each I/O does not reopen the file.
     files: Mutex<HashMap<FileKey, Arc<File>>>,
 }
@@ -56,13 +62,18 @@ impl LocalDirBackend {
         check_block_size(root, meta.dev(), Path::new(SYSFS_DEV_BLOCK))?;
 
         let rel_dir = root.join(REL_DIR);
-        match fs::create_dir(&rel_dir) {
-            Ok(()) => fsync_dir(root)?,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(io_err("mkdir", &rel_dir, e)),
+        let wal_dir = root.join(WAL_DIR);
+        for dir in [&rel_dir, &wal_dir] {
+            match fs::create_dir(dir) {
+                Ok(()) => fsync_dir(root)?,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(io_err("mkdir", dir, e)),
+            }
         }
         Ok(Self {
+            root: root.to_path_buf(),
             rel_dir,
+            wal_dir,
             files: Mutex::new(HashMap::new()),
         })
     }
@@ -70,12 +81,18 @@ impl LocalDirBackend {
     fn path(&self, file: FileKey) -> PathBuf {
         match file {
             FileKey::Relation(r) => self.rel_dir.join(r.0.to_string()),
+            FileKey::Wal { timeline, segno } => {
+                self.wal_dir.join(format!("{timeline:08X}{segno:016X}"))
+            }
+            FileKey::Control => self.root.join(CONTROL_FILE),
         }
     }
 
     fn parent_dir(&self, file: FileKey) -> &Path {
         match file {
             FileKey::Relation(_) => &self.rel_dir,
+            FileKey::Wal { .. } => &self.wal_dir,
+            FileKey::Control => &self.root,
         }
     }
 

@@ -32,22 +32,45 @@ impl FenceToken {
     }
 }
 
+/// Supplies the current fencing token for writes to shared storage.
+pub trait FenceSource: Send + Sync + fmt::Debug {
+    fn fence_token(&self) -> FenceToken;
+}
+
+/// A fixed token (single install mode, tests).
+#[derive(Debug, Clone, Copy)]
+pub struct FixedFence(pub FenceToken);
+
+impl FenceSource for FixedFence {
+    fn fence_token(&self) -> FenceToken {
+        self.0
+    }
+}
+
 /// Identifier of a relation's data file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RelFileId(pub u32);
 
 /// Logical name of a file managed by a backend.
 ///
-/// WAL and control files will be added in the WAL step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FileKey {
     Relation(RelFileId),
+    /// WAL segment `segno` of `timeline`.
+    Wal {
+        timeline: u32,
+        segno: u64,
+    },
+    /// The control file.
+    Control,
 }
 
 impl fmt::Display for FileKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FileKey::Relation(r) => write!(f, "relation {}", r.0),
+            FileKey::Wal { timeline, segno } => write!(f, "WAL segment {timeline:08X}{segno:016X}"),
+            FileKey::Control => f.write_str("control file"),
         }
     }
 }
