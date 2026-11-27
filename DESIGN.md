@@ -4,6 +4,12 @@
 decisions의 변경은 채팅 리뷰를 거친 뒤에만 반영하고, 반영 시 아래 변경 이력에 남긴다.
 
 ## 변경 이력
+- r6 (2026-11-27)
+  - [추가] WAL 레코드는 연산 단위 physiological 방식 (PG 방식, rmgr별 redo 함수).
+  - [추가] critical section 오류와 fsync 실패 시 프로세스 abort 후 WAL 복구 (PG PANIC, data_sync_retry=off).
+  - [추가] control 파일은 4KB 블록 두 개를 번갈아 쓰고 CRC + 일련번호로 최신 유효본을 고른다.
+  - [추가] WAL 세그먼트는 재활용하지 않는다 (삭제 후 0으로 채운 새 세그먼트 생성). 세그먼트 16MB, 파일 이름에 timeline 포함.
+  - [추가] kill -9 테스트는 통합 테스트가 자기 자신을 작업 모드로 재실행하는 방식.
 - r5 (2026-11-27)
   - [추가] B+Tree 키는 memcomparable 인코딩(바이트 비교 = 타입 순서)으로 저장하고 memcmp로 비교.
   - [추가] B+Tree 엔트리 키 끝에 heap TID를 붙여 모든 엔트리를 고유하게 함.
@@ -183,6 +189,8 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - 체크포인트 스레드가 주기적으로(시간 또는 WAL 양 기준) 실행한다.
 - 체크포인트 시작 LSN을 redo 시작점으로 control 파일에 기록하고, 그 이전 WAL은 재활용/삭제 대상이 된다.
 - full page write와 hint bit FPI는 "마지막 체크포인트 redo 시작점 이후 첫 변경" 기준으로 판단한다.
+- control 파일은 4KB 블록 두 개를 번갈아 쓰고, 각 블록에 CRC와 일련번호를 둔다. 읽을 때 유효한 블록 중 일련번호가 가장 큰 것을 쓴다.
+  근거: rename 없이 원자적 갱신이 되므로 블록 디바이스 백엔드에서도 동작하고, 디바이스의 섹터 원자적 쓰기에 기대지 않는다 (PG는 512B 섹터 원자성에 기댄다).
 
 [트랜잭션과 동시성 제어]
 - 트랜잭션 ID는 64비트.
@@ -225,6 +233,13 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 
 [내구성]
 - WAL 기반. fsync 의미(파일 및 디렉토리 fsync)를 정확히 지킨다.
+- WAL 레코드는 연산 단위 physiological 방식이다 (PG와 동일). 레코드는 rmgr(heap, btree, xlog, smgr)와 연산 종류, block ref 목록(필요 시 full page image 포함), main data로 구성하고, rmgr별 redo 함수로 재생한다. 복구는 redo만 한다 (undo 없음, 미완료 트랜잭션은 MVCC/CLOG가 처리).
+  근거: 학습 우선. WAL이 작고, redo 의미를 직접 구현한다. 재생이 원래 실행과 같은 결과(같은 슬롯 등)를 내야 하는 부담을 감수한다.
+- LSN은 WAL 스트림의 바이트 위치(u64)다.
+- WAL 세그먼트는 16MB, 파일 이름은 timeline + 세그먼트 번호. 재활용하지 않고, 다 쓴 세그먼트는 삭제하며 새 세그먼트는 0으로 채워 만든다.
+  근거: 재활용된 세그먼트의 옛 내용을 WAL 끝으로 오인하지 않으므로 WAL 블록 헤더가 필요 없다. 끝 판정은 CRC, 길이, prev_lsn 체인으로 한다.
+- critical section(페이지 수정 후 WAL 기록 완료 전) 안의 오류, WAL 쓰기 실패, fsync 실패 시 프로세스를 abort하고 재시작 시 WAL로 복구한다 (PG의 PANIC, data_sync_retry=off와 동일).
+  근거: fsync가 한 번 실패하면 커널이 dirty 데이터를 이미 버렸을 수 있어 재시도가 안전하지 않다 (fsyncgate). 라이브러리 코드의 이 abort는 unwrap/expect 금지 규칙과 별개의 의도된 종료다.
 
 [프로세스 모델]
 - 멀티스레드, 세션당 스레드.
@@ -243,6 +258,7 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - sqllogictest가 검증하지 못하는 영역은 별도 테스트로 다룬다:
   - 동시성: 다중 세션을 섞어 실행하는 격리 수준, FK 경쟁, deadlock 검출 테스트 (PG isolation tester 유사)
   - 크래시 복구: 임의 시점 강제 종료(kill -9) 후 재시작 및 정합성 검증
+    통합 테스트가 자기 자신을 작업 모드로 재실행하고 SIGKILL로 종료한다 (별도 테스트 바이너리 없음).
   - HA: 전환 중 강제 종료, 노드 정지, reader 지연 상황에서의 정합성 검증
 - 특정 코드 지점에서 멈추거나 죽어야 하는 테스트(예: fencing 검사 직후 쓰기 직전의 정지)는 failpoint로 재현한다 (fail 크레이트 등, 테스트 빌드에서만 활성화).
 - B+Tree, 페이지 포맷 등은 proptest로 속성 기반 테스트.

@@ -9,7 +9,7 @@ Rust로 구현하는 학습용 OLTP 데이터베이스. PostgreSQL 와이어 프
 - `DESIGN.md`의 decisions, ha_and_backup_design, open_questions는 사용자가 명시적으로 지시할 때만 수정한다.
 
 ## 현재 단계
-- 1단계 4번: B+Tree 인덱스 (Lehman-Yao right-link + high key, split, merge 없음)
+- 1단계 5번: WAL + 체크포인트 + 백그라운드 writer + 크래시 복구 (redo 우선, full page write, hint bit FPI, kill -9 테스트 통과)
   (단계가 끝나면 사용자가 이 줄을 갱신한다)
 
 ## 작업 방식
