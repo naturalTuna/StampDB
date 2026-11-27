@@ -176,8 +176,10 @@ fn two_way_deadlock_is_detected() {
     let lm = LockManager::new();
     let a = LockTag::Relation(RelFileId(1));
     let b = LockTag::Relation(RelFileId(2));
-    lm.acquire(T1, a, LockMode::Exclusive, no_wait()).unwrap();
-    lm.acquire(T2, b, LockMode::Exclusive, no_wait()).unwrap();
+    lm.acquire(T1, a.clone(), LockMode::Exclusive, no_wait())
+        .unwrap();
+    lm.acquire(T2, b.clone(), LockMode::Exclusive, no_wait())
+        .unwrap();
     let barrier = Barrier::new(2);
     let results = std::thread::scope(|s| {
         let h1 = s.spawn(|| {
@@ -271,4 +273,85 @@ fn holder_upgrade_skips_the_queue_without_deadlock() {
         lm.release_all(T1);
         assert_eq!(h2.join().unwrap(), Ok(()));
     });
+}
+
+fn key(k: u8) -> LockTag {
+    LockTag::Key {
+        index: RelFileId(500),
+        key: vec![1, k],
+    }
+}
+
+#[test]
+fn key_locks_share_and_conflict_by_value() {
+    let lm = LockManager::new();
+    // Children referencing the same parent key share it.
+    lm.acquire(T1, key(1), LockMode::Share, no_wait()).unwrap();
+    lm.acquire(T2, key(1), LockMode::Share, no_wait()).unwrap();
+    // Removing that key waits for them; another key is independent.
+    assert_eq!(
+        lm.acquire(T3, key(1), LockMode::Exclusive, no_wait()),
+        Err(LockError::Timeout)
+    );
+    lm.acquire(T3, key(2), LockMode::Exclusive, no_wait())
+        .unwrap();
+    assert_eq!(
+        lm.acquire(T1, key(2), LockMode::Share, no_wait()),
+        Err(LockError::Timeout)
+    );
+    assert_eq!(lm.key_locks(), 2, "failed requests leave no entries");
+    lm.release_all(T1);
+    lm.release_all(T2);
+    lm.acquire(T3, key(1), LockMode::Exclusive, no_wait())
+        .unwrap();
+    lm.release_all(T3);
+    assert_eq!(lm.key_locks(), 0);
+}
+
+#[test]
+fn key_lock_table_is_bounded() {
+    let lm = LockManager::with_key_limit(3);
+    for k in 0..3 {
+        lm.acquire(T1, key(k), LockMode::Share, no_wait()).unwrap();
+    }
+    // Re-locking a held key needs no new entry.
+    lm.acquire(T2, key(0), LockMode::Share, no_wait()).unwrap();
+    assert_eq!(
+        lm.acquire(T2, key(9), LockMode::Share, no_wait()),
+        Err(LockError::OutOfKeyLocks(3))
+    );
+    // Table and transaction locks are not limited.
+    lm.acquire(T2, REL, LockMode::Share, no_wait()).unwrap();
+    lm.release(T1, key(1), LockMode::Share);
+    lm.acquire(T2, key(9), LockMode::Share, no_wait()).unwrap();
+    lm.release_all(T1);
+    lm.release_all(T2);
+    assert_eq!(lm.key_locks(), 0);
+}
+
+#[test]
+fn key_lock_deadlocks_are_detected() {
+    let lm = LockManager::new();
+    lm.acquire(T1, key(1), LockMode::Share, no_wait()).unwrap();
+    lm.acquire(T2, key(2), LockMode::Share, no_wait()).unwrap();
+    let results = std::thread::scope(|s| {
+        let a = s.spawn(|| {
+            let r = lm.acquire(T1, key(2), LockMode::Exclusive, fast_deadlock());
+            if r.is_err() {
+                lm.release_all(T1);
+            }
+            r
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        let b = lm.acquire(T2, key(1), LockMode::Exclusive, fast_deadlock());
+        lm.release_all(T2);
+        let a = a.join().unwrap();
+        lm.release_all(T1);
+        [a, b]
+    });
+    let deadlocks = results
+        .iter()
+        .filter(|r| **r == Err(LockError::Deadlock))
+        .count();
+    assert_eq!(deadlocks, 1, "{results:?}");
 }

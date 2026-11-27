@@ -50,6 +50,9 @@ pub mod code {
     pub const WRONG_OBJECT_TYPE: &str = "42809";
     pub const CANNOT_COERCE: &str = "42846";
     pub const LOCK_NOT_AVAILABLE: &str = "55P03";
+    pub const OUT_OF_MEMORY: &str = "53200";
+    pub const FOREIGN_KEY_VIOLATION: &str = "23503";
+    pub const INVALID_FOREIGN_KEY: &str = "42830";
     pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
     pub const TOO_MANY_COLUMNS: &str = "54011";
     pub const INTERNAL_ERROR: &str = "XX000";
@@ -91,6 +94,7 @@ impl From<LockError> for SqlError {
         let c = match e {
             LockError::Timeout => code::LOCK_NOT_AVAILABLE,
             LockError::Deadlock => code::DEADLOCK_DETECTED,
+            LockError::OutOfKeyLocks(_) => code::OUT_OF_MEMORY,
         };
         Self::new(c, e.to_string())
     }

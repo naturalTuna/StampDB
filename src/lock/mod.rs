@@ -17,6 +17,12 @@
 //! (PostgreSQL's deadlock_timeout and DeadLockCheck; the requester is the
 //! victim). Latches are never part of this graph (DESIGN).
 //!
+//! Row-level key locks (DESIGN r2/r13) live in the same table, keyed by
+//! (unique index, encoded key value) rather than TID, so a foreign key's
+//! shared lock on a parent key survives updates of the parent row. Their
+//! number is bounded; a request beyond the bound fails (PostgreSQL's "out
+//! of shared memory").
+//!
 //! The table is one mutex with one condition variable; PostgreSQL
 //! partitions it 16 ways. Deadlock detection needs a consistent view of all
 //! waits, which one mutex gives directly.
@@ -27,7 +33,7 @@ pub use mode::LockMode;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -36,13 +42,25 @@ use crate::storage::backend::RelFileId;
 use crate::txn::{TxnId, Xid};
 
 /// What a lock protects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LockTag {
     /// A table (or index).
     Relation(RelFileId),
     /// A transaction, held by itself until it ends.
     Transaction(Xid),
+    /// A key value of a unique index (memcomparable encoding): foreign
+    /// keys share-lock the parent key they reference.
+    Key { index: RelFileId, key: Vec<u8> },
 }
+
+impl LockTag {
+    fn is_key(&self) -> bool {
+        matches!(self, LockTag::Key { .. })
+    }
+}
+
+/// Default bound on the number of key locks (distinct locked keys).
+pub const DEFAULT_MAX_KEY_LOCKS: usize = 1_000_000;
 
 /// Errors from lock acquisition.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -52,6 +70,9 @@ pub enum LockError {
 
     #[error("deadlock detected")]
     Deadlock,
+
+    #[error("out of shared memory: the key lock table is full ({0} keys)")]
+    OutOfKeyLocks(usize),
 }
 
 /// Result alias for this module.
@@ -139,15 +160,50 @@ impl LockState {
 }
 
 /// The lock manager.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LockManager {
     table: Mutex<HashMap<LockTag, LockState>>,
     cv: Condvar,
+    /// Key lock entries in `table` (changed under its mutex).
+    keys: AtomicUsize,
+    max_keys: usize,
+}
+
+impl Default for LockManager {
+    fn default() -> Self {
+        Self::with_key_limit(DEFAULT_MAX_KEY_LOCKS)
+    }
 }
 
 impl LockManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A lock manager holding at most `max_keys` key locks.
+    pub fn with_key_limit(max_keys: usize) -> Self {
+        Self {
+            table: Mutex::new(HashMap::new()),
+            cv: Condvar::new(),
+            keys: AtomicUsize::new(0),
+            max_keys,
+        }
+    }
+
+    /// Number of key locks in the table (tests and diagnostics).
+    pub fn key_locks(&self) -> usize {
+        let _t = self.table.lock();
+        self.keys.load(Ordering::SeqCst)
+    }
+
+    /// Removes `tag`'s entry if nothing holds or waits for it.
+    fn remove_if_empty(&self, table: &mut HashMap<LockTag, LockState>, tag: &LockTag) {
+        if table.get(tag).is_some_and(LockState::is_empty) {
+            table.remove(tag);
+            if tag.is_key() {
+                self.keys.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Acquires `tag` in `mode` for `owner`, waiting as `policy` allows.
@@ -159,7 +215,13 @@ impl LockManager {
         policy: WaitPolicy,
     ) -> Result<()> {
         let mut table = self.table.lock();
-        let state = table.entry(tag).or_default();
+        if tag.is_key() && !table.contains_key(&tag) {
+            if self.keys.load(Ordering::SeqCst) >= self.max_keys {
+                return Err(LockError::OutOfKeyLocks(self.max_keys));
+            }
+            self.keys.fetch_add(1, Ordering::SeqCst);
+        }
+        let state = table.entry(tag.clone()).or_default();
         let ahead_conflict =
             !state.holds_any(owner) && state.waiters.iter().any(|w| mode.conflicts(w.mode));
         if !ahead_conflict && !state.conflicts_with_holders(owner, mode) {
@@ -192,11 +254,12 @@ impl LockManager {
                 None
             };
             if let Some(err) = failure {
-                Self::cancel_wait(&mut table, tag, &granted);
+                Self::cancel_wait(&mut table, &tag, &granted);
                 // Our departure may unblock waiters queued behind us.
                 if table.get_mut(&tag).is_some_and(LockState::wake) {
                     self.cv.notify_all();
                 }
+                self.remove_if_empty(&mut table, &tag);
                 return if granted.load(Ordering::SeqCst) {
                     Ok(())
                 } else {
@@ -255,10 +318,10 @@ impl LockManager {
     /// Removes our queued request (if not granted meanwhile).
     fn cancel_wait(
         table: &mut HashMap<LockTag, LockState>,
-        tag: LockTag,
+        tag: &LockTag,
         granted: &Arc<AtomicBool>,
     ) {
-        if let Some(state) = table.get_mut(&tag) {
+        if let Some(state) = table.get_mut(tag) {
             state.waiters.retain(|w| !Arc::ptr_eq(&w.granted, granted));
         }
     }
@@ -277,9 +340,7 @@ impl LockManager {
             }
         }
         let woke = state.wake();
-        if state.is_empty() {
-            table.remove(&tag);
-        }
+        self.remove_if_empty(&mut table, &tag);
         if woke {
             self.cv.notify_all();
         }
@@ -289,12 +350,18 @@ impl LockManager {
     pub fn release_all(&self, owner: TxnId) {
         let mut table = self.table.lock();
         let mut woke = false;
-        table.retain(|_, state| {
+        let mut keys_removed = 0;
+        table.retain(|tag, state| {
             if state.holders.remove(&owner).is_some() {
                 woke |= state.wake();
             }
-            !state.is_empty()
+            let keep = !state.is_empty();
+            if !keep && tag.is_key() {
+                keys_removed += 1;
+            }
+            keep
         });
+        self.keys.fetch_sub(keys_removed, Ordering::SeqCst);
         if woke {
             self.cv.notify_all();
         }
@@ -303,7 +370,7 @@ impl LockManager {
     /// Waits until transaction `xid` has ended (its lock is free).
     pub fn wait_for_xid(&self, owner: TxnId, xid: Xid, policy: WaitPolicy) -> Result<()> {
         let tag = LockTag::Transaction(xid);
-        self.acquire(owner, tag, LockMode::Share, policy)?;
+        self.acquire(owner, tag.clone(), LockMode::Share, policy)?;
         self.release(owner, tag, LockMode::Share);
         Ok(())
     }

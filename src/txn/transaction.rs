@@ -169,6 +169,15 @@ impl Transaction {
             .acquire(self.id, LockTag::Relation(rel), mode, self.policy)?)
     }
 
+    /// Locks a key value of unique index `index` until the transaction
+    /// ends (foreign keys: Share on a referenced parent key, Exclusive to
+    /// remove or change it).
+    pub fn lock_key(&self, index: RelFileId, key: Vec<u8>, mode: LockMode) -> Result<()> {
+        Ok(self
+            .locks
+            .acquire(self.id, LockTag::Key { index, key }, mode, self.policy)?)
+    }
+
     /// Deletes `rel`'s file if this transaction aborts (it created it).
     pub fn drop_on_abort(&mut self, rel: RelFileId) {
         self.drop_on_abort.push(rel);

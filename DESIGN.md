@@ -4,6 +4,10 @@
 decisions의 변경은 채팅 리뷰를 거친 뒤에만 반영하고, 반영 시 아래 변경 이력에 남긴다.
 
 ## 변경 이력
+- r13 (2026-11-27)
+  - [추가] 키 잠금: lock manager의 Key 태그(unique 인덱스, 인코딩된 키), 트랜잭션 종료까지 유지, 자식 Share / 부모 삭제·키 변경 Exclusive, deadlock 검출 공유, 상한(기본 100만 키) 초과 시 53200.
+  - [추가] FK 검사: NO ACTION과 RESTRICT는 같게 행 단위 즉시 검사, 부모 쪽 참조 확인은 자식 인덱스(있으면) 또는 seq scan, 자식 인덱스 강제 생성 없음, SI에서 스냅샷 이후 커밋된 행이 관련되면 직렬화 오류.
+  - [이동] open_questions의 FK CASCADE / SET NULL(답변: 바로)을 decisions로 이동: 11단계에서 NO ACTION 다음에 구현, SET DEFAULT도 포함.
 - r12 (2026-11-27)
   - [추가] 제약 카탈로그 sys_constraint(PG pg_constraint 대응), CHECK 식은 SQL 텍스트로 저장해 사용 시 다시 바인딩, NOT NULL은 attnotnull, PK는 unique 인덱스 + NOT NULL + indisprimary.
   - [추가] 10단계 범위: CREATE TABLE의 컬럼/테이블 제약과 DEFAULT(SQL 텍스트로 저장). ALTER TABLE ADD/DROP CONSTRAINT는 이후.
@@ -282,7 +286,8 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - DEFAULT는 sys_attribute에 SQL 텍스트로 저장하고 INSERT/UPDATE의 DEFAULT 위치에서 다시 바인딩한다. 컬럼을 참조할 수 없다.
 - PK와 UNIQUE는 B+Tree 인덱스로 강제한다.
 - FOREIGN KEY는 다음 범위로 제한한다:
-  - 동작은 NO ACTION / RESTRICT만 지원. CASCADE, SET NULL은 open_questions 참조.
+  - 동작은 NO ACTION / RESTRICT / CASCADE / SET NULL / SET DEFAULT (r13). NO ACTION과 RESTRICT는 같게 동작한다 (행 단위 즉시 검사; PG의 NO ACTION은 문장 끝 검사).
+  - 연쇄 동작(CASCADE/SET NULL/SET DEFAULT)은 실행기가 자식 행을 직접 삭제·갱신하며, 그 행에도 자식 쪽 제약과 다시 연쇄되는 FK를 적용한다 (PG는 RI 트리거 + SPI). 갱신 충돌은 일반 DML과 같은 규칙(RC는 대기 후 최신 버전 재확인, SI는 직렬화 오류).
   - 즉시 검사만 지원 (DEFERRABLE 미지원).
   - 참조 대상은 PK 또는 UNIQUE 제약이 있는 컬럼이어야 한다.
   - 자식 행 삽입/수정 시 부모 행에 행 단위 공유 잠금(PG의 FOR KEY SHARE 유사)을 건다.
@@ -291,6 +296,9 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
   - 잠금 테이블의 키는 (참조 대상 relation, unique 인덱스 ID, 키 값)이다. TID를 키로 쓰지 않는다.
     근거: TID 키는 부모 행이 UPDATE되어 새 버전이 생기면 잠금이 옛 버전에 남는다. PG는 이를 update chain을 따라가는 MultiXact로 해결하며, 그것이 복잡도의 근원이다. FK는 항상 unique 키를 참조하므로 키 값 기반이 자연스럽다.
   - 잠금 테이블이 상한에 도달하면 새 잠금을 요청한 트랜잭션을 에러로 취소한다 (PG의 "out of shared memory" / max_locks_per_transaction과 같은 성격).
+  - 키 잠금은 lock manager의 Key 태그로 두어 테이블·트랜잭션 잠금과 같은 대기열과 deadlock 검출을 쓴다. 자식 삽입·FK 컬럼 변경은 부모 키에 Share, 부모 행 삭제·참조 키 변경은 Exclusive를 트랜잭션 끝까지 잡는다. 상한은 키 개수 기준(기본 100만), 초과 시 53200. escalation 없음.
+  - 자식 쪽 검사는 키 잠금 후 부모 unique 인덱스에서 "커밋됐고 커밋된 삭제가 없는" 행을 찾는다 (진행 중인 삽입은 없는 것으로 본다). 부모 쪽 검사는 키 잠금 후 자식에서 살아 있는 참조 행을 찾는다: FK 컬럼이 선두인 자식 인덱스가 있으면 그것으로, 없으면 seq scan. 자식 인덱스를 자동으로 만들지 않는다 (PG와 같음).
+  - SI 트랜잭션에서 검사에 관련된 행이 스냅샷 이후 커밋된 변경이면 직렬화 오류(40001)로 처리한다 (PG의 crosscheck 스냅샷).
   - Snapshot Isolation에서도 부모 존재 확인은 트랜잭션 스냅샷이 아닌 최신 커밋 상태 기준으로 한다.
 
 [Vacuum]
@@ -414,10 +422,6 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 내 답에 대해 impact_review_protocol에 따라 검토하라. 확정되면 decisions로 옮긴다.
 
 [답변했으나 검토 조건에 대한 확인 대기]
-- FK의 CASCADE / SET NULL 추가 시점. (답변: 바로)
-  검토: 조건부 진행. decisions의 "NO ACTION/RESTRICT만"과 충돌하므로 확정 시 decisions도 수정해야 함.
-  선행 조건: deadlock 처리, 잠금 테이블 상한 정책(둘 다 r2에서 확정). 11단계 안에서 NO ACTION 완성 후 추가.
-  연쇄 경로 전체에 RC의 EvalPlanQual / SI 직렬화 오류가 적용되며, 실행기 재귀 호출이 필요(PG는 RI 트리거 + SPI).
 - pg_catalog 호환 범위. (답변: 기본)
   제안: "psql 접속 + 단순 쿼리 + JDBC/psycopg 접속 성공"을 1차 범위로, psql \d는 2차.
   내부 카탈로그는 자체 구조, pg_catalog는 그 위의 뷰.
