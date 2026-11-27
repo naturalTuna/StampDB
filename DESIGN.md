@@ -4,6 +4,10 @@
 decisions의 변경은 채팅 리뷰를 거친 뒤에만 반영하고, 반영 시 아래 변경 이력에 남긴다.
 
 ## 변경 이력
+- r8 (2026-11-27)
+  - [추가] vacuum: 트랜잭션별 스냅샷 xmin 등록으로 horizon 계산, ShareUpdateExclusive 테이블 lock.
+  - [추가] FSM은 vacuum이 갱신하는 메모리 기반(영속화·WAL 없음).
+  - [추가] B+Tree 페이지 삭제는 부모에 형제가 있고 가장 오른쪽이 아닌 빈 leaf만. 삭제된 페이지는 당분간 재사용하지 않음.
 - r7 (2026-11-27)
   - [추가] CLOG는 버퍼 풀을 쓰는 전용 relation에 둔다. 커밋 레코드 flush 후 CLOG 비트 설정, 체크포인트 후 첫 변경은 FPI.
   - [추가] 테이블 lock은 PG의 8가지 모드와 충돌표.
@@ -245,6 +249,15 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - autovacuum은 서버 내부의 백그라운드 워커 스레드로 동작한다.
 - vacuum은 heap의 죽은 튜플과 인덱스의 죽은 엔트리를 함께 정리하고, 빈 B+Tree 페이지를 삭제한다.
 - 64비트 xid이므로 wraparound 방지용 freeze는 필요 없다. 다만 오래된 CLOG를 잘라내기 위한 커밋 확정 처리는 이후 추가한다.
+- 정리 기준(horizon): 각 트랜잭션이 자기 스냅샷의 xmin을 실행 중 목록에 등록한다 (PG의 MyProc->xmin). horizon = min(등록된 xmin, 실행 중 xid, next_xid).
+  xmax가 horizon 이전에 커밋된 튜플과 xmin이 abort된 튜플이 죽은 튜플이다.
+- 처리 순서(PG lazy vacuum 단순화): heap prune(죽은 튜플을 DEAD line pointer로, 페이지 압축) → 인덱스 일괄 삭제 → DEAD를 UNUSED로. 각 단계는 WAL 기록.
+- vacuum은 ShareUpdateExclusive 테이블 lock을 잡는다 (동시 DML 허용). 페이지 압축은 exclusive 페이지 lock으로 충분하다.
+  근거: 모든 읽기가 lock 아래에서 튜플을 복사하므로 PG의 cleanup lock(다른 pin 없음)이 필요 없다.
+- FSM은 vacuum이 갱신하는 메모리 기반 맵이다. 영속화와 WAL 기록을 하지 않고, 재시작 후 다음 vacuum까지 비어 있다.
+  근거: FSM은 참고 정보라 오래된 값이어도 정합성에 영향이 없다 (PG FSM도 WAL로 엄밀히 보호되지 않는다).
+- B+Tree 페이지 삭제는 부모에 다른 자식이 있고 가장 오른쪽이 아닌 빈 leaf만 대상으로 한다 (부모 downlink 제거 = HALF_DEAD, 형제 링크 연결 = DELETED, right-link 유지).
+  삭제된 페이지는 당분간 재사용하지 않는다 (재사용 시점 판단은 이후).
 
 [내구성]
 - WAL 기반. fsync 의미(파일 및 디렉토리 fsync)를 정확히 지킨다.
