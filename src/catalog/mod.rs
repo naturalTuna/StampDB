@@ -605,8 +605,26 @@ impl Catalog {
         Ok(())
     }
 
+    /// The indexes of `table`, opened (for statements maintaining them row
+    /// by row).
+    pub fn table_indexes(
+        &self,
+        txn: &mut Transaction,
+        table: &RelationInfo,
+    ) -> Result<Vec<(IndexInfo, BTree)>> {
+        self.indexes_of(txn, table.oid)?
+            .into_iter()
+            .map(|i| {
+                let tree = BTree::open(i.rel, self.engine.pool().clone())?;
+                Ok((i, tree))
+            })
+            .collect()
+    }
+
+    /// Adds the entry for a row at `tid` to one index of `table`, enforcing
+    /// uniqueness; see [`Catalog::insert_index_entries`].
     #[allow(clippy::too_many_arguments)]
-    fn insert_entry(
+    pub fn insert_entry(
         &self,
         txn: &mut Transaction,
         table: &RelationInfo,

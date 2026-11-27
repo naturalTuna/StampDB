@@ -560,7 +560,9 @@ impl HeapFile {
 
     /// Visible tuples of one page. Suggested hint bits are applied if the
     /// exclusive lock is free, to tuples whose xmin/xmax are unchanged.
-    fn read_page_mvcc(
+    /// The tuples of block `blk` visible to `snap` (one page of a
+    /// sequential scan), setting hint bits opportunistically.
+    pub fn read_page_mvcc(
         &self,
         blk: BlockNumber,
         snap: &Snapshot,

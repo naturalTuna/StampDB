@@ -524,34 +524,46 @@ impl Expr {
     /// Rewrites column references with `f` (e.g. to shift them when the
     /// input row layout changes).
     pub fn map_columns(&self, f: &dyn Fn(usize) -> usize) -> Expr {
-        let m = |e: &Expr| Box::new(e.map_columns(f));
         match self {
-            Expr::Const(v) => Expr::Const(v.clone()),
             Expr::Column(i) => Expr::Column(f(*i)),
-            Expr::Neg(a) => Expr::Neg(m(a)),
-            Expr::Not(a) => Expr::Not(m(a)),
+            e => e
+                .rebuild(&mut |c| Ok(c.map_columns(f)))
+                .unwrap_or_else(|_| e.clone()),
+        }
+    }
+
+    /// The same node with each direct child replaced by `f(child)`.
+    pub fn rebuild(&self, f: &mut dyn FnMut(&Expr) -> Result<Expr>) -> Result<Expr> {
+        let mut b = |e: &Expr| -> Result<Box<Expr>> { Ok(Box::new(f(e)?)) };
+        Ok(match self {
+            Expr::Const(_) | Expr::Column(_) => self.clone(),
+            Expr::Neg(a) => Expr::Neg(b(a)?),
+            Expr::Not(a) => Expr::Not(b(a)?),
             Expr::IsNull { arg, negated } => Expr::IsNull {
-                arg: m(arg),
+                arg: b(arg)?,
                 negated: *negated,
             },
             Expr::Cast { arg, to, mode } => Expr::Cast {
-                arg: m(arg),
+                arg: b(arg)?,
                 to: *to,
                 mode: *mode,
             },
             Expr::Binary { op, l, r } => Expr::Binary {
                 op: *op,
-                l: m(l),
-                r: m(r),
+                l: b(l)?,
+                r: b(r)?,
             },
-            Expr::And(l, r) => Expr::And(m(l), m(r)),
-            Expr::Or(l, r) => Expr::Or(m(l), m(r)),
+            Expr::And(l, r) => Expr::And(b(l)?, b(r)?),
+            Expr::Or(l, r) => Expr::Or(b(l)?, b(r)?),
             Expr::Case { whens, otherwise } => Expr::Case {
                 whens: whens
                     .iter()
-                    .map(|(c, v)| (c.map_columns(f), v.map_columns(f)))
-                    .collect(),
-                otherwise: otherwise.as_ref().map(|o| m(o)),
+                    .map(|(c, v)| Ok((*b(c)?, *b(v)?)))
+                    .collect::<Result<_>>()?,
+                otherwise: match otherwise {
+                    Some(o) => Some(b(o)?),
+                    None => None,
+                },
             },
             Expr::Like {
                 arg,
@@ -559,22 +571,24 @@ impl Expr {
                 negated,
                 case_insensitive,
             } => Expr::Like {
-                arg: m(arg),
-                pattern: m(pattern),
+                arg: b(arg)?,
+                pattern: b(pattern)?,
                 negated: *negated,
                 case_insensitive: *case_insensitive,
             },
             Expr::InList { arg, list, negated } => Expr::InList {
-                arg: m(arg),
-                list: list.iter().map(|e| e.map_columns(f)).collect(),
+                arg: b(arg)?,
+                list: list.iter().map(|e| Ok(*b(e)?)).collect::<Result<_>>()?,
                 negated: *negated,
             },
-            Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(|e| e.map_columns(f)).collect()),
+            Expr::Coalesce(args) => {
+                Expr::Coalesce(args.iter().map(|e| Ok(*b(e)?)).collect::<Result<_>>()?)
+            }
             Expr::Func { func, args } => Expr::Func {
                 func: *func,
-                args: args.iter().map(|e| e.map_columns(f)).collect(),
+                args: args.iter().map(|e| Ok(*b(e)?)).collect::<Result<_>>()?,
             },
-        }
+        })
     }
 }
 

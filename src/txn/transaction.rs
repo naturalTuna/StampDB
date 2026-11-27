@@ -87,6 +87,16 @@ impl Transaction {
         self.isolation
     }
 
+    /// Changes the isolation level; refused (`false`) once a snapshot has
+    /// been taken (SET TRANSACTION must precede any query).
+    pub fn set_isolation(&mut self, isolation: Isolation) -> bool {
+        if self.snapshot.is_some() {
+            return false;
+        }
+        self.isolation = isolation;
+        true
+    }
+
     pub fn tm(&self) -> &dyn TransactionManager {
         self.tm.as_ref()
     }
