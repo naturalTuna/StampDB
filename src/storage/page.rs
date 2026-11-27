@@ -69,6 +69,8 @@ impl BlockNumber {
 pub enum PageKind {
     Heap = 1,
     BTree = 2,
+    /// Commit log page: transaction status bits after the header.
+    Clog = 3,
 }
 
 impl PageKind {
@@ -76,6 +78,7 @@ impl PageKind {
         match v {
             1 => Some(Self::Heap),
             2 => Some(Self::BTree),
+            3 => Some(Self::Clog),
             _ => None,
         }
     }

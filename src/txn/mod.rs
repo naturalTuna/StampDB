@@ -8,9 +8,12 @@
 //! * [`ProcArray`] assigns xids and tracks the running ones; a
 //!   [`Snapshot`] is a copy of that state (PostgreSQL's GetSnapshotData).
 
+pub mod clog;
+mod manager;
 mod procarray;
 mod snapshot;
 
+pub use manager::LocalTxnManager;
 pub use procarray::ProcArray;
 pub use snapshot::Snapshot;
 

@@ -26,7 +26,7 @@ use crate::storage::StorageError;
 use crate::storage::backend::{FenceSource, RelFileId, StorageBackend};
 use crate::storage::disk::DiskManager;
 use crate::storage::page::{Lsn, page_lsn, set_page_lsn};
-use crate::txn::Xid;
+use crate::txn::{LocalTxnManager, TxnError, Xid};
 
 /// `info` values of the Smgr resource manager.
 pub mod smgr_info {
@@ -55,6 +55,9 @@ pub enum RecoveryError {
     #[error("record {0:?} is malformed")]
     BadRecord(Lsn),
 
+    #[error(transparent)]
+    Txn(#[from] TxnError),
+
     #[error("checkpoint could not write {0} pages (flush deferred)")]
     CheckpointDeferred(usize),
 }
@@ -69,6 +72,12 @@ pub fn initdb(
     fence: Arc<dyn FenceSource>,
     cfg: WalConfig,
 ) -> Result<()> {
+    // The commit log's file exists from the start; its pages are created
+    // (and logged) as xids are assigned.
+    backend.create(
+        crate::storage::backend::FileKey::Relation(crate::txn::clog::CLOG_REL),
+        fence.fence_token(),
+    )?;
     let wal = Wal::create(backend.clone(), fence.clone(), cfg)?;
     let redo = wal.begin_checkpoint();
     let (start, end) = wal.insert(&checkpoint_record(redo))?;
@@ -81,7 +90,7 @@ pub fn initdb(
             timeline: cfg.timeline,
             checkpoint: start,
             redo,
-            next_xid: Xid(1),
+            next_xid: Xid::FIRST,
         },
     )?;
     Ok(())
@@ -96,6 +105,7 @@ pub struct Engine {
     disk: Arc<DiskManager>,
     pool: Arc<BufferPool>,
     wal: Arc<Wal>,
+    txn: Arc<LocalTxnManager>,
     control: Mutex<(ControlFile, ControlData)>,
     /// Serializes checkpoints.
     checkpoint_lock: Mutex<()>,
@@ -128,22 +138,28 @@ impl Engine {
         // Replay with an unlogged pool: the WAL being replayed is already
         // durable, so WAL-before-data holds trivially.
         let disk = Arc::new(DiskManager::new(backend.clone()));
-        let (end, last) = {
+        let (end, last, max_xid) = {
             let pool = BufferPool::new(nframes, disk.clone(), flush.clone())?;
             let mut rd = WalReader::new(backend.clone(), cfg, redo, None)?;
+            let mut max_xid = Xid::INVALID;
             while let Some((start, end, d)) = rd.next_record()? {
+                max_xid = max_xid.max(d.record.xid);
                 apply(&disk, &pool, &d.record, start, end, fence.as_ref())?;
             }
             pool.flush_all()?;
-            (rd.end_lsn(), rd.last_start())
+            (rd.end_lsn(), rd.last_start(), max_xid)
         };
+        // Xids seen in WAL may be newer than the control file's value.
+        let next_xid = data.next_xid.max(max_xid.next());
 
         let wal = Arc::new(Wal::open_at(backend, fence, cfg, end, last, redo)?);
         let pool = Arc::new(BufferPool::new(nframes, disk.clone(), flush)?.with_wal(wal.clone()));
+        let txn = Arc::new(LocalTxnManager::new(pool.clone(), next_xid)?);
         let engine = Self {
             disk,
             pool,
             wal,
+            txn,
             control: Mutex::new((cf, data)),
             checkpoint_lock: Mutex::new(()),
         };
@@ -158,6 +174,11 @@ impl Engine {
 
     pub fn wal(&self) -> &Arc<Wal> {
         &self.wal
+    }
+
+    /// The transaction manager.
+    pub fn txn(&self) -> &Arc<LocalTxnManager> {
+        &self.txn
     }
 
     /// Current control file contents.
@@ -192,6 +213,7 @@ impl Engine {
         ctl.1.state = DbState::InProduction;
         ctl.1.checkpoint = start;
         ctl.1.redo = redo;
+        ctl.1.next_xid = self.txn.next_xid();
         let data = ctl.1;
         ctl.0.write(&data);
         drop(ctl);

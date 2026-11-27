@@ -15,6 +15,9 @@ pub enum RedoError {
     #[error(transparent)]
     BTree(#[from] btree::BTreeError),
 
+    #[error(transparent)]
+    Clog(#[from] crate::txn::clog::ClogError),
+
     #[error("record of rmgr {0:?} has no page redo")]
     NoPageRedo(RmgrId),
 }
@@ -26,6 +29,7 @@ pub fn redo_block(rec: &Record, idx: usize, page: &mut [u8]) -> Result<(), RedoE
     match rec.rmgr {
         RmgrId::Heap => Ok(heap::redo(rec.info, idx, block, page)?),
         RmgrId::Btree => Ok(btree::redo(rec, idx, page)?),
+        RmgrId::Xact => Ok(crate::txn::clog::redo(rec, page)?),
         RmgrId::Xlog | RmgrId::Smgr => Err(RedoError::NoPageRedo(rec.rmgr)),
     }
 }

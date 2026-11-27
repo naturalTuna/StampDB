@@ -67,6 +67,8 @@ pub enum RmgrId {
     Smgr = 1,
     Heap = 2,
     Btree = 3,
+    /// Transaction commit/abort and commit log pages.
+    Xact = 4,
 }
 
 impl RmgrId {
@@ -76,6 +78,7 @@ impl RmgrId {
             1 => Some(Self::Smgr),
             2 => Some(Self::Heap),
             3 => Some(Self::Btree),
+            4 => Some(Self::Xact),
             _ => None,
         }
     }
@@ -447,7 +450,7 @@ mod tests {
         fn roundtrip(xid in any::<u64>(), info in any::<u8>(), prev in any::<u64>(),
                      blocks in prop::collection::vec(block(), 0..4),
                      main in prop::collection::vec(any::<u8>(), 0..500),
-                     rmgr in prop_oneof![Just(RmgrId::Xlog), Just(RmgrId::Smgr), Just(RmgrId::Heap), Just(RmgrId::Btree)]) {
+                     rmgr in prop_oneof![Just(RmgrId::Xlog), Just(RmgrId::Smgr), Just(RmgrId::Heap), Just(RmgrId::Btree), Just(RmgrId::Xact)]) {
             let rec = Record { xid: Xid(xid), rmgr, info, blocks, main };
             let bytes = rec.encode(Lsn(prev)).unwrap();
             let d = decode(&bytes).unwrap();
