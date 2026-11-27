@@ -3,6 +3,7 @@
 mod aligned;
 pub mod backend;
 pub mod checksum;
+pub mod disk;
 mod error;
 pub mod local;
 pub mod page;

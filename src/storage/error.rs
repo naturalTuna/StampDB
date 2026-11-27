@@ -35,6 +35,19 @@ pub enum StorageError {
         reason: String,
     },
 
+    /// File length is not a whole number of pages.
+    #[error("{file} has length {len}, not a multiple of the page size")]
+    InvalidFileLength {
+        file: crate::storage::backend::FileKey,
+        len: u64,
+    },
+
+    /// Relation would exceed the maximum block number.
+    #[error("{file} is too large")]
+    RelationTooLarge {
+        file: crate::storage::backend::FileKey,
+    },
+
     /// Device logical block size is not supported (startup refused).
     #[error("unsupported logical block size {size} (must divide 4096)")]
     BlockSizeUnsupported { size: u64 },
