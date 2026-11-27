@@ -357,6 +357,81 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> SlottedPage<B> {
         self.set_upper(pos);
     }
 
+    /// Inserts an item as slot `pos`, shifting the line pointers at `pos`
+    /// and after up by one. Returns `false` if there is not enough free space.
+    ///
+    /// For index pages, whose line pointer order is the key order. Unlike
+    /// [`SlottedPage::add_item`], this renumbers later slots, so it must not
+    /// be used on heap pages (TIDs there must stay stable).
+    pub fn insert_item_at(&mut self, pos: SlotId, data: &[u8]) -> Result<bool> {
+        let len = data.len();
+        if len == 0 || len > MAX_ITEM_SIZE {
+            return Err(StorageError::InvalidItemSize { len });
+        }
+        let count = self.slot_count();
+        if pos.0 > count {
+            return Err(StorageError::InvalidSlot { slot: pos.0 });
+        }
+        let (lower, upper) = (self.lower(), self.upper());
+        let aligned = len.next_multiple_of(ITEM_ALIGN);
+        if upper - lower < aligned + LINE_POINTER_SIZE {
+            return Ok(false);
+        }
+        let new_upper = upper - aligned;
+        let at = lp_offset(pos.0);
+        let bytes = self.bytes_mut();
+        bytes[new_upper..new_upper + len].copy_from_slice(data);
+        bytes[new_upper + len..upper].fill(0);
+        bytes.copy_within(at..lower, at + LINE_POINTER_SIZE);
+        self.set_lp(
+            pos.0,
+            ItemId {
+                off: new_upper as u16,
+                len: len as u16,
+                state: ItemState::Normal,
+            },
+        );
+        self.set_lower(lower + LINE_POINTER_SIZE);
+        self.set_upper(new_upper);
+        Ok(true)
+    }
+
+    /// Removes slot `pos`, shifting later line pointers down by one, and
+    /// closes the gap in the item data immediately (PostgreSQL's
+    /// `PageIndexTupleDelete`). Index pages only, as with `insert_item_at`.
+    pub fn remove_item_at(&mut self, pos: SlotId) -> Result<()> {
+        let id = self
+            .item_id(pos)
+            .ok_or(StorageError::InvalidSlot { slot: pos.0 })?;
+        if id.has_storage() {
+            let (off, size) = (
+                usize::from(id.off),
+                usize::from(id.len).next_multiple_of(ITEM_ALIGN),
+            );
+            let upper = self.upper();
+            // Move everything stored below the removed item up by `size`.
+            self.bytes_mut().copy_within(upper..off, upper + size);
+            self.bytes_mut()[upper..upper + size].fill(0);
+            for s in 0..self.slot_count() {
+                if let Some(mut other) = self.item_id(SlotId(s))
+                    && other.has_storage()
+                    && usize::from(other.off) < off
+                {
+                    other.off += size as u16;
+                    self.set_lp(s, other);
+                }
+            }
+            self.set_upper(upper + size);
+        }
+        let lower = self.lower();
+        let at = lp_offset(pos.0);
+        let bytes = self.bytes_mut();
+        bytes.copy_within(at + LINE_POINTER_SIZE..lower, at);
+        bytes[lower - LINE_POINTER_SIZE..lower].fill(0);
+        self.set_lower(lower - LINE_POINTER_SIZE);
+        Ok(())
+    }
+
     fn expect_state(&self, slot: SlotId, expected: ItemState) -> Result<ItemId> {
         let id = self
             .item_id(slot)
@@ -569,6 +644,44 @@ mod tests {
     }
 
     #[test]
+    fn ordered_insert_and_remove() {
+        let mut p = empty(0);
+        assert!(p.insert_item_at(SlotId(0), b"b").unwrap());
+        assert!(p.insert_item_at(SlotId(0), b"a").unwrap());
+        assert!(p.insert_item_at(SlotId(2), b"d").unwrap());
+        assert!(p.insert_item_at(SlotId(2), b"c").unwrap());
+        let items = |p: &SlottedPage<Vec<u8>>| -> Vec<Vec<u8>> {
+            (0..p.slot_count())
+                .map(|s| p.get_item(SlotId(s)).unwrap().to_vec())
+                .collect()
+        };
+        assert_eq!(items(&p), [b"a", b"b", b"c", b"d"]);
+        assert!(matches!(
+            p.insert_item_at(SlotId(9), b"x"),
+            Err(StorageError::InvalidSlot { slot: 9 })
+        ));
+
+        p.remove_item_at(SlotId(1)).unwrap();
+        assert_eq!(items(&p), [b"a", b"c", b"d"]);
+        assert_eq!(p.upper(), PAGE_SIZE - 3 * ITEM_ALIGN, "gap closed");
+        assert!(p.bytes()[p.lower()..p.upper()].iter().all(|&b| b == 0));
+        assert!(p.remove_item_at(SlotId(3)).is_err());
+        SlottedPage::open(p.bytes()).unwrap();
+    }
+
+    #[test]
+    fn ordered_insert_reports_full_page() {
+        let mut p = empty(0);
+        let mut n = 0u16;
+        while p.insert_item_at(SlotId(0), &[n as u8; 100]).unwrap() {
+            n += 1;
+        }
+        assert_eq!(usize::from(n), (PAGE_SIZE - PAGE_HEADER_SIZE) / 108);
+        // Newest first: slot 0 holds the last inserted item.
+        assert_eq!(p.get_item(SlotId(0)), Some(&[(n - 1) as u8; 100][..]));
+    }
+
+    #[test]
     fn line_pointer_roundtrip() {
         for id in [
             ItemId::UNUSED,
@@ -618,7 +731,61 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    enum OrderedOp {
+        InsertAt(usize, Vec<u8>),
+        RemoveAt(usize),
+    }
+
+    fn ordered_op() -> impl Strategy<Value = OrderedOp> {
+        prop_oneof![
+            3 => (any::<usize>(), prop::collection::vec(any::<u8>(), 1..300))
+                .prop_map(|(i, d)| OrderedOp::InsertAt(i, d)),
+            1 => any::<usize>().prop_map(OrderedOp::RemoveAt),
+        ]
+    }
+
     proptest! {
+        #[test]
+        fn ordered_ops_match_model(ops in prop::collection::vec(ordered_op(), 1..200),
+                                   special_units in 0usize..3) {
+            let special = special_units * SPECIAL_ALIGN;
+            let mut p = empty(special);
+            p.special_mut().fill(0xAB);
+            let mut model: Vec<Vec<u8>> = Vec::new();
+            for op in ops {
+                match op {
+                    OrderedOp::InsertAt(i, d) => {
+                        let pos = i % (model.len() + 1);
+                        let fits = p.upper() - p.lower()
+                            >= d.len().next_multiple_of(ITEM_ALIGN) + LINE_POINTER_SIZE;
+                        prop_assert_eq!(p.insert_item_at(SlotId(pos as u16), &d).unwrap(), fits);
+                        if fits {
+                            model.insert(pos, d);
+                        }
+                    }
+                    OrderedOp::RemoveAt(i) => {
+                        if model.is_empty() {
+                            prop_assert!(p.remove_item_at(SlotId(0)).is_err());
+                        } else {
+                            let pos = i % model.len();
+                            p.remove_item_at(SlotId(pos as u16)).unwrap();
+                            model.remove(pos);
+                        }
+                    }
+                }
+                prop_assert!(SlottedPage::open(p.bytes()).is_ok());
+                prop_assert_eq!(usize::from(p.slot_count()), model.len());
+                for (s, d) in model.iter().enumerate() {
+                    prop_assert_eq!(p.get_item(SlotId(s as u16)), Some(&d[..]));
+                }
+                // No fragmentation: data is always contiguous below special.
+                let used: usize = model.iter().map(|d| d.len().next_multiple_of(ITEM_ALIGN)).sum();
+                prop_assert_eq!(p.upper(), PAGE_SIZE - special - used);
+                prop_assert!(p.special().iter().all(|&b| b == 0xAB));
+            }
+        }
+
         #[test]
         fn matches_model(ops in prop::collection::vec(op(), 1..200),
                          special_units in 0usize..4) {
