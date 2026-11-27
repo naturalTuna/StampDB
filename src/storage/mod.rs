@@ -6,6 +6,8 @@ pub mod checksum;
 pub mod disk;
 mod error;
 pub mod local;
+#[cfg(test)]
+pub(crate) mod mem;
 pub mod page;
 pub mod slotted;
 
