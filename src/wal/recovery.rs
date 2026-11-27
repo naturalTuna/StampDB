@@ -28,6 +28,21 @@ use crate::storage::disk::DiskManager;
 use crate::storage::page::{Lsn, page_lsn, set_page_lsn};
 use crate::txn::{LocalTxnManager, TxnError, Xid};
 
+/// First OID handed out for user objects; lower ones are reserved for the
+/// system (as in PostgreSQL).
+pub const FIRST_OID: u32 = 16384;
+
+/// OIDs reserved per NEXTOID record.
+const OID_PREFETCH: u32 = 8192;
+
+/// OID counter state.
+#[derive(Debug)]
+struct OidState {
+    next: u32,
+    /// Upper bound already logged (or recorded in the control file).
+    logged_upto: u32,
+}
+
 /// `info` values of the Smgr resource manager.
 pub mod smgr_info {
     /// Main data: relation file id (u32 LE).
@@ -91,6 +106,7 @@ pub fn initdb(
             checkpoint: start,
             redo,
             next_xid: Xid::FIRST,
+            next_oid: FIRST_OID,
         },
     )?;
     Ok(())
@@ -106,6 +122,7 @@ pub struct Engine {
     pool: Arc<BufferPool>,
     wal: Arc<Wal>,
     txn: Arc<LocalTxnManager>,
+    oids: Mutex<OidState>,
     control: Mutex<(ControlFile, ControlData)>,
     /// Serializes checkpoints.
     checkpoint_lock: Mutex<()>,
@@ -138,12 +155,22 @@ impl Engine {
         // Replay with an unlogged pool: the WAL being replayed is already
         // durable, so WAL-before-data holds trivially.
         let disk = Arc::new(DiskManager::new(backend.clone()));
+        let mut max_oid = data.next_oid.max(FIRST_OID);
         let (end, last, max_xid) = {
             let pool = BufferPool::new(nframes, disk.clone(), flush.clone())?;
             let mut rd = WalReader::new(backend.clone(), cfg, redo, None)?;
             let mut max_xid = Xid::INVALID;
             while let Some((start, end, d)) = rd.next_record()? {
                 max_xid = max_xid.max(d.record.xid);
+                if d.record.rmgr == RmgrId::Xlog && d.record.info == xlog_info::NEXTOID {
+                    let b: [u8; 4] = d
+                        .record
+                        .main
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| RecoveryError::BadRecord(start))?;
+                    max_oid = max_oid.max(u32::from_le_bytes(b));
+                }
                 apply(&disk, &pool, &d.record, start, end, fence.as_ref())?;
             }
             pool.flush_all()?;
@@ -160,6 +187,10 @@ impl Engine {
             pool,
             wal,
             txn,
+            oids: Mutex::new(OidState {
+                next: max_oid,
+                logged_upto: max_oid,
+            }),
             control: Mutex::new((cf, data)),
             checkpoint_lock: Mutex::new(()),
         };
@@ -184,6 +215,22 @@ impl Engine {
     /// Current control file contents.
     pub fn control_data(&self) -> ControlData {
         self.control.lock().1
+    }
+
+    /// Allocates a new OID (never reused, even after a crash, once anything
+    /// logged after it is durable).
+    pub fn allocate_oid(&self) -> Result<u32> {
+        let mut o = self.oids.lock();
+        if o.next >= o.logged_upto {
+            let upto = o.next + OID_PREFETCH;
+            let mut rec = Record::new(RmgrId::Xlog, xlog_info::NEXTOID);
+            rec.main = upto.to_le_bytes().to_vec();
+            self.wal.insert(&rec)?;
+            o.logged_upto = upto;
+        }
+        let oid = o.next;
+        o.next += 1;
+        Ok(oid)
     }
 
     /// Creates an empty relation file and logs it, so recovery recreates
@@ -214,6 +261,7 @@ impl Engine {
         ctl.1.checkpoint = start;
         ctl.1.redo = redo;
         ctl.1.next_xid = self.txn.next_xid();
+        ctl.1.next_oid = self.oids.lock().logged_upto;
         let data = ctl.1;
         ctl.0.write(&data);
         drop(ctl);
@@ -251,7 +299,9 @@ fn apply(
             }
             return Ok(());
         }
-        RmgrId::Xlog if rec.info == xlog_info::CHECKPOINT => return Ok(()),
+        RmgrId::Xlog if rec.info == xlog_info::CHECKPOINT || rec.info == xlog_info::NEXTOID => {
+            return Ok(());
+        }
         _ => {}
     }
     for (idx, b) in rec.blocks.iter().enumerate() {
@@ -577,6 +627,40 @@ mod tests {
         drop(e);
         let e = start(&mem, 24);
         assert_eq!(verify(&e), (0..1500).collect());
+    }
+
+    #[test]
+    fn oids_are_unique_across_crash_and_checkpoint() {
+        let mem = fresh();
+        let used = {
+            let e = start(&mem, 16);
+            let a = e.allocate_oid().unwrap();
+            let b = e.allocate_oid().unwrap();
+            assert_eq!((a, b), (FIRST_OID, FIRST_OID + 1));
+            e.create_relation(RelFileId(b)).unwrap();
+            e.wal().flush_all();
+            b
+        };
+        let e = start(&mem, 16);
+        let c = e.allocate_oid().unwrap();
+        assert!(c > used, "{c} reused after crash");
+        let redo = e.checkpoint().unwrap();
+        let _ = redo;
+        drop(e);
+        let e = start(&mem, 16);
+        assert!(e.allocate_oid().unwrap() > c);
+    }
+
+    #[test]
+    fn bootstrap_xid_is_committed() {
+        use crate::txn::{TransactionManager, XidStatus};
+        let mem = fresh();
+        let e = start(&mem, 16);
+        assert_eq!(
+            e.txn().status(Xid::BOOTSTRAP).unwrap(),
+            XidStatus::Committed
+        );
+        assert_eq!(e.txn().assign_xid().unwrap(), Xid::FIRST);
     }
 
     #[test]

@@ -77,6 +77,7 @@ fn control_file_on_direct_io() {
         checkpoint: Lsn(n),
         redo: Lsn(n),
         next_xid: Xid(n),
+        next_oid: n as u32,
     };
     {
         let be: Arc<dyn StorageBackend> = Arc::new(LocalDirBackend::open(dir.path()).unwrap());

@@ -209,7 +209,7 @@ mod tests {
         all.sort();
         all.dedup();
         assert_eq!(all.len(), 2000, "xids are unique");
-        assert_eq!(pa.next_xid(), Xid(2001));
+        assert_eq!(pa.next_xid(), Xid(Xid::FIRST.0 + 2000));
         assert_eq!(pa.snapshot().running.len(), 1000);
     }
 }

@@ -37,6 +37,8 @@ pub mod xlog_info {
     pub const CHECKPOINT: u8 = 0;
     /// A full page image taken because only hint bits changed.
     pub const FPI_FOR_HINT: u8 = 1;
+    /// OIDs below the value in main data (u32 LE) may be in use.
+    pub const NEXTOID: u8 = 2;
 }
 
 const BLOCK: u64 = IO_ALIGN as u64;

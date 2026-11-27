@@ -29,8 +29,11 @@ impl Xid {
     /// "No transaction" (e.g. a tuple's xmax when it was never deleted).
     pub const INVALID: Xid = Xid(0);
 
+    /// Always committed: rows written by initdb (system catalogs).
+    pub const BOOTSTRAP: Xid = Xid(1);
+
     /// The first xid handed out by a new cluster.
-    pub const FIRST: Xid = Xid(1);
+    pub const FIRST: Xid = Xid(2);
 
     pub fn is_valid(self) -> bool {
         self != Self::INVALID

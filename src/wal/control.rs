@@ -8,7 +8,8 @@
 //!
 //! ```text
 //! 0 magic u32 | 4 version u32 | 8 seq u64 | 16 state u8 | 20 timeline u32
-//! 24 checkpoint u64 | 32 redo u64 | 40 next_xid u64 | ... | 4092 crc u32
+//! 24 checkpoint u64 | 32 redo u64 | 40 next_xid u64 | 48 next_oid u32 |
+//! ... | 4092 crc u32
 //! ```
 
 use std::sync::Arc;
@@ -55,8 +56,10 @@ pub struct ControlData {
     pub checkpoint: Lsn,
     /// Where redo starts for that checkpoint.
     pub redo: Lsn,
-    /// Next transaction ID to assign (used from the transaction step).
+    /// Next transaction ID to assign.
     pub next_xid: Xid,
+    /// OIDs below this may have been used (upper bound logged so far).
+    pub next_oid: u32,
 }
 
 impl ControlData {
@@ -70,6 +73,7 @@ impl ControlData {
         block[24..32].copy_from_slice(&self.checkpoint.0.to_le_bytes());
         block[32..40].copy_from_slice(&self.redo.0.to_le_bytes());
         block[40..48].copy_from_slice(&self.next_xid.0.to_le_bytes());
+        block[48..52].copy_from_slice(&self.next_oid.to_le_bytes());
         let crc = crc32c::crc32c(&block[..CRC_OFF]);
         block[CRC_OFF..].copy_from_slice(&crc.to_le_bytes());
     }
@@ -97,6 +101,7 @@ impl ControlData {
                 checkpoint: Lsn(u64_at(24)),
                 redo: Lsn(u64_at(32)),
                 next_xid: Xid(u64_at(40)),
+                next_oid: u32_at(48),
             },
         ))
     }
@@ -193,6 +198,7 @@ mod tests {
             checkpoint: Lsn(n * 100),
             redo: Lsn(n * 90),
             next_xid: Xid(n),
+            next_oid: n as u32,
         }
     }
 

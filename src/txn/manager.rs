@@ -85,6 +85,9 @@ impl TransactionManager for LocalTxnManager {
     }
 
     fn status(&self, xid: Xid) -> Result<XidStatus> {
+        if xid == Xid::BOOTSTRAP {
+            return Ok(XidStatus::Committed);
+        }
         // Running first: a committing transaction's bits may already be set
         // before its commit record is durable.
         if self.procs.is_running(xid) {
