@@ -173,7 +173,13 @@ impl<B: AsRef<[u8]>> Node<B> {
 
     /// Lehman-Yao: the target lies to the right if it is not below the
     /// high key.
+    /// A half-dead or deleted page is always passed to the right
+    /// (PostgreSQL's P_IGNORE): its key range now belongs to its right
+    /// sibling.
     pub fn must_move_right(&self, target: &[u8]) -> Result<bool> {
+        if self.op.flags & (flags::HALF_DEAD | flags::DELETED) != 0 && !self.op.is_rightmost() {
+            return Ok(true);
+        }
         Ok(match self.high_key()? {
             Some(high) => target >= high,
             None => false,

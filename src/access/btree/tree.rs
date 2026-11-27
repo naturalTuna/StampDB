@@ -64,6 +64,12 @@ pub mod info {
     pub const CREATE: u8 = 4;
     /// Block 0: slots removed by vacuum, u16 each, in removal order.
     pub const BULK_DELETE: u8 = 5;
+    /// Block 0 parent: `slot u16`; its downlink takes over the next item's
+    /// child, which is removed. Block 1: the leaf, now HALF_DEAD.
+    pub const MARK_HALFDEAD: u8 = 6;
+    /// Main data: has-left flag. Blocks: [left sibling (`next u32`)], the
+    /// leaf (DELETED), the right sibling (`prev u32`).
+    pub const UNLINK: u8 = 7;
 
     /// SPLIT main-data flag: an old right sibling block follows.
     pub const SPLIT_HAS_SIBLING: u8 = 0x01;
@@ -87,6 +93,9 @@ pub struct BTree {
     /// died before the downlink was inserted.
     #[cfg(test)]
     stop_after_split: AtomicBool,
+    /// Test hook: stop page deletion after the first phase.
+    #[cfg(test)]
+    stop_after_halfdead: AtomicBool,
 }
 
 impl BTree {
@@ -96,6 +105,8 @@ impl BTree {
             pool,
             #[cfg(test)]
             stop_after_split: AtomicBool::new(false),
+            #[cfg(test)]
+            stop_after_halfdead: AtomicBool::new(false),
         }
     }
 
@@ -276,6 +287,184 @@ impl BTree {
         rec.blocks.push(b);
         self.log(rec, &mut [&mut page[..]]);
         Ok(slots.len())
+    }
+
+    /// Deletes empty leaf pages (after vacuum's bulk delete) in two phases,
+    /// as PostgreSQL does, and finishes deletions a crash left half done.
+    /// Only a leaf that is not the rightmost of its level and whose parent
+    /// also holds its right sibling's downlink is deleted (DESIGN r8);
+    /// deleted pages are not reused. Returns how many pages were deleted.
+    pub fn delete_empty_pages(&self) -> Result<usize> {
+        let mut deleted = 0;
+        let n = self.pool.nblocks(self.rel)?;
+        for blk in META_BLOCK + 1..n {
+            let state = {
+                let pin = self.fetch(blk)?;
+                let page = pin.read();
+                if crate::storage::page::is_new_page(&page) {
+                    continue;
+                }
+                let node = Node::open(&page[..])?;
+                let op = node.opaque();
+                if !op.is_leaf() || op.flags & flags::DELETED != 0 {
+                    continue;
+                }
+                if op.flags & flags::HALF_DEAD != 0 {
+                    PageState::HalfDead
+                } else if !op.is_rightmost() && node.slot_count() == node.first_data() {
+                    PageState::Empty
+                } else {
+                    continue;
+                }
+            };
+            if state == PageState::Empty && !self.mark_half_dead(blk)? {
+                continue;
+            }
+            #[cfg(test)]
+            if self.stop_after_halfdead.load(Ordering::SeqCst) {
+                continue;
+            }
+            self.unlink(blk)?;
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
+
+    /// Phase 1: takes the empty leaf's key range away from it. Locks the
+    /// leaf, then its parent (bottom-up); the parent's downlink to the leaf
+    /// is re-pointed at the right sibling, whose own downlink is removed.
+    /// Returns false (doing nothing) if the leaf is no longer eligible.
+    fn mark_half_dead(&self, blk: u32) -> Result<bool> {
+        let pin = self.fetch(blk)?;
+        let mut page = pin.write();
+        let op = {
+            let node = Node::open(&page[..])?;
+            let op = node.opaque();
+            let eligible = op.is_leaf()
+                && op.flags & (flags::HALF_DEAD | flags::DELETED | flags::INCOMPLETE_SPLIT) == 0
+                && !op.is_rightmost()
+                && node.slot_count() == node.first_data();
+            if !eligible {
+                return Ok(false);
+            }
+            op
+        };
+        // Find the parent by walking the level above.
+        let mut pblk = self.leftmost_at(1)?;
+        loop {
+            let ppin = self.fetch(pblk)?;
+            let mut ppage = ppin.write();
+            let (slot, next, pcount) = {
+                let pnode = Node::open(&ppage[..])?;
+                (
+                    pnode.find_downlink(blk)?,
+                    pnode.opaque().next,
+                    pnode.slot_count(),
+                )
+            };
+            let Some(slot) = slot else {
+                if next == P_NONE {
+                    return Ok(false); // no downlink (unfinished split): skip
+                }
+                drop(ppage);
+                pblk = next;
+                continue;
+            };
+            // The right sibling's downlink must follow in this parent.
+            if slot + 1 >= pcount || Node::open(&ppage[..])?.child_at(slot + 1)? != op.next {
+                return Ok(false);
+            }
+            redo_halfdead_parent(&mut ppage, slot)?;
+            ppage.mark_dirty();
+            set_flags(&mut page, flags::HALF_DEAD)?;
+            page.mark_dirty();
+            let mut pb = BlockRef::new(self.rel, BlockNumber(pblk));
+            pb.data = slot.to_le_bytes().to_vec();
+            let mut rec = Record::new(RmgrId::Btree, info::MARK_HALFDEAD);
+            rec.blocks = vec![pb, BlockRef::new(self.rel, BlockNumber(blk))];
+            self.log(rec, &mut [&mut ppage[..], &mut page[..]]);
+            return Ok(true);
+        }
+    }
+
+    /// Phase 2: unlinks the half-dead leaf from its siblings, locking left
+    /// sibling, leaf, and right sibling left to right. The leaf keeps its
+    /// right-link so a scan standing on it can still move right.
+    fn unlink(&self, blk: u32) -> Result<()> {
+        let prev = {
+            let pin = self.fetch(blk)?;
+            let page = pin.read();
+            Node::open(&page[..])?.opaque().prev
+        };
+        // The left sibling may have split since: move right to the page
+        // whose right-link is the leaf.
+        let mut lpin = None;
+        if prev != P_NONE {
+            let mut lblk = prev;
+            loop {
+                let pin = self.fetch(lblk)?;
+                let next = {
+                    let page = pin.read();
+                    Node::open(&page[..])?.opaque().next
+                };
+                if next == blk {
+                    lpin = Some((lblk, pin));
+                    break;
+                }
+                if next == P_NONE {
+                    return Err(BTreeError::Corrupt(
+                        "left sibling chain does not reach the page",
+                    ));
+                }
+                lblk = next;
+            }
+        }
+        let mut lpage = lpin.as_ref().map(|(_, p)| p.write());
+        if let Some(lp) = lpage.as_ref()
+            && Node::open(&lp[..])?.opaque().next != blk
+        {
+            // Split between our check and the lock: retry from scratch.
+            drop(lpage);
+            return self.unlink(blk);
+        }
+        let pin = self.fetch(blk)?;
+        let mut page = pin.write();
+        let op = Node::open(&page[..])?.opaque();
+        if op.flags & flags::HALF_DEAD == 0 {
+            return Ok(()); // someone finished it
+        }
+        let rpin = self.fetch(op.next)?;
+        let mut rpage = rpin.write();
+
+        let left_blk = lpin.as_ref().map(|(b, _)| *b).unwrap_or(P_NONE);
+        if let Some(lp) = lpage.as_mut() {
+            set_next(lp, op.next)?;
+            lp.mark_dirty();
+        }
+        clear_flags(&mut page, flags::HALF_DEAD)?;
+        set_flags(&mut page, flags::DELETED)?;
+        page.mark_dirty();
+        set_prev(&mut rpage, left_blk)?;
+        rpage.mark_dirty();
+
+        let mut rec = Record::new(RmgrId::Btree, info::UNLINK);
+        let mut rb = BlockRef::new(self.rel, BlockNumber(op.next));
+        rb.data = left_blk.to_le_bytes().to_vec();
+        match lpage.as_mut() {
+            Some(lp) => {
+                let mut lb = BlockRef::new(self.rel, BlockNumber(left_blk));
+                lb.data = op.next.to_le_bytes().to_vec();
+                rec.main = vec![1];
+                rec.blocks = vec![lb, BlockRef::new(self.rel, BlockNumber(blk)), rb];
+                self.log(rec, &mut [&mut lp[..], &mut page[..], &mut rpage[..]]);
+            }
+            None => {
+                rec.main = vec![0];
+                rec.blocks = vec![BlockRef::new(self.rel, BlockNumber(blk)), rb];
+                self.log(rec, &mut [&mut page[..], &mut rpage[..]]);
+            }
+        }
+        Ok(())
     }
 
     /// Entries whose key lies within the bounds, in key order (then TID).
@@ -641,6 +830,60 @@ fn image_block(rel: RelFileId, blk: u32, page: &[u8]) -> BlockRef {
     b
 }
 
+/// Leaf state found by the page deletion scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageState {
+    Empty,
+    HalfDead,
+}
+
+/// Sets `bits` in a node page's flags.
+fn set_flags(page: &mut [u8], bits: u16) -> Result<()> {
+    let mut node = Node::open(page)?;
+    let op = Opaque {
+        flags: node.opaque().flags | bits,
+        ..node.opaque()
+    };
+    node.set_opaque(op);
+    Ok(())
+}
+
+fn set_next(page: &mut [u8], next: u32) -> Result<()> {
+    let mut node = Node::open(page)?;
+    let op = Opaque {
+        next,
+        ..node.opaque()
+    };
+    node.set_opaque(op);
+    Ok(())
+}
+
+fn set_prev(page: &mut [u8], prev: u32) -> Result<()> {
+    let mut node = Node::open(page)?;
+    let op = Opaque {
+        prev,
+        ..node.opaque()
+    };
+    node.set_opaque(op);
+    Ok(())
+}
+
+/// Parent side of MARK_HALFDEAD: the downlink at `slot` takes the next
+/// item's child, and the next item is removed.
+fn redo_halfdead_parent(page: &mut [u8], slot: u16) -> Result<()> {
+    let mut node = Node::open(page)?;
+    let right = node.child_at(slot + 1)?;
+    let item = node.item(slot)?.to_vec();
+    let sep = &item[..item.len() - CHILD_LEN];
+    let new_item = internal_item(sep, right);
+    node.remove_at(slot + 1)?;
+    node.remove_at(slot)?;
+    if !node.insert_at(slot, &new_item)? {
+        return Err(BTreeError::Corrupt("re-pointed downlink does not fit"));
+    }
+    Ok(())
+}
+
 /// Clears `bits` in a node page's flags.
 fn clear_flags(page: &mut [u8], bits: u16) -> Result<()> {
     let mut node = Node::open(page)?;
@@ -703,6 +946,19 @@ pub fn redo(rec: &Record, idx: usize, page: &mut [u8]) -> Result<()> {
             }
         }
         (info::NEWROOT, 1) => clear_flags(page, flags::ROOT | flags::INCOMPLETE_SPLIT),
+        (info::MARK_HALFDEAD, 0) => redo_halfdead_parent(page, slot()?),
+        (info::MARK_HALFDEAD, 1) => set_flags(page, flags::HALF_DEAD),
+        (info::UNLINK, i) => {
+            let has_left = rec.main.first() == Some(&1);
+            match (has_left, i) {
+                (true, 0) => set_next(page, u32_at(0)?),
+                (true, 1) | (false, 0) => {
+                    clear_flags(page, flags::HALF_DEAD)?;
+                    set_flags(page, flags::DELETED)
+                }
+                _ => set_prev(page, u32_at(0)?),
+            }
+        }
         (info::NEWROOT, 2) => Meta {
             root: u32_at(0)?,
             level: u32_at(4)?,
@@ -1512,6 +1768,124 @@ mod tests {
         assert!(left.iter().all(|t| !dead(*t)), "no dead entry survives");
         assert_eq!(left.len(), 200 + 400);
         check_invariants(&tree);
+    }
+
+    /// Number of leaves reachable through the leaf level's right-links.
+    fn leaf_count(tree: &BTree) -> usize {
+        let mut n = 0;
+        let mut blk = tree.leftmost_at(0).unwrap();
+        loop {
+            n += 1;
+            let pin = tree.fetch(blk).unwrap();
+            let page = pin.read();
+            let op = Node::open(&page[..]).unwrap().opaque();
+            if op.is_rightmost() {
+                return n;
+            }
+            blk = op.next;
+        }
+    }
+
+    /// A tree with several leaves whose middle entries (ids 100..300) are
+    /// then removed by a bulk delete.
+    type Entries = Vec<(Vec<u8>, Tid)>;
+
+    fn tree_with_empty_middle() -> (Arc<MemBackend>, Arc<BufferPool>, BTree, Entries) {
+        let (mem, pool, tree) = setup_wal();
+        let mut keep = Vec::new();
+        for i in 0..400u32 {
+            let e = (key(i as i64, 200), tid(i));
+            tree.insert(&e.0, e.1).unwrap();
+            if !(100..300).contains(&i) {
+                keep.push(e);
+            }
+        }
+        let n = tree
+            .bulk_delete(&|t: Tid| (100..300).contains(&(t.blk.0 * 100 + u32::from(t.slot.0))))
+            .unwrap();
+        assert_eq!(n, 200);
+        keep.sort();
+        (mem, pool, tree, keep)
+    }
+
+    #[test]
+    fn empty_leaves_are_deleted_in_two_phases() {
+        let (mem, pool, tree, keep) = tree_with_empty_middle();
+        let before = leaf_count(&tree);
+        let deleted = tree.delete_empty_pages().unwrap();
+        assert!(deleted >= 3, "deleted {deleted}");
+        assert_eq!(leaf_count(&tree), before - deleted);
+        assert_eq!(check_invariants(&tree).len(), keep.len());
+        assert_eq!(all(&tree), keep);
+        assert_eq!(
+            tree.delete_empty_pages().unwrap(),
+            0,
+            "nothing left to delete"
+        );
+
+        // Keys in a deleted page's range now go to its right sibling.
+        tree.insert(&key(150, 200), tid(9_999)).unwrap();
+        let got: Vec<Tid> = tree
+            .scan(
+                Bound::Included(key(150, 200)),
+                Bound::Included(key(150, 200)),
+            )
+            .unwrap()
+            .map(|r| r.unwrap().1)
+            .collect();
+        assert_eq!(got, vec![tid(9_999)]);
+        check_invariants(&tree);
+
+        pool.wal().unwrap().flush_all();
+        let replayed = replay(&mem);
+        for blk in 0..pool.nblocks(REL).unwrap() {
+            let pin = tree.fetch(blk).unwrap();
+            let mut live = pin.read().to_vec();
+            live[8..12].fill(0);
+            let mut want = replayed
+                .get(&blk)
+                .cloned()
+                .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
+            want[8..12].fill(0);
+            assert_eq!(live, want, "block {blk} differs after replay");
+        }
+    }
+
+    #[test]
+    fn half_dead_page_is_finished_later() {
+        let (_mem, _pool, tree, keep) = tree_with_empty_middle();
+        tree.stop_after_halfdead.store(true, Ordering::SeqCst);
+        assert_eq!(tree.delete_empty_pages().unwrap(), 0);
+        tree.stop_after_halfdead.store(false, Ordering::SeqCst);
+        // Half-dead pages have no downlink but are still chained: searches
+        // and inserts pass them to the right.
+        assert_eq!(all(&tree), keep);
+        tree.insert(&key(120, 200), tid(8_888)).unwrap();
+        assert!(tree.delete_empty_pages().unwrap() >= 1);
+        check_invariants(&tree);
+        assert_eq!(all(&tree).len(), keep.len() + 1);
+    }
+
+    #[test]
+    fn page_deletion_with_concurrent_inserts_and_scans() {
+        let (_mem, _pool, tree, _keep) = tree_with_empty_middle();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..300u32 {
+                    tree.insert(&key(1000 + i as i64, 200), tid(50_000 + i))
+                        .unwrap();
+                }
+            });
+            s.spawn(|| {
+                for _ in 0..30 {
+                    let got = all(&tree);
+                    assert!(got.windows(2).all(|w| w[0] < w[1]));
+                }
+            });
+            tree.delete_empty_pages().unwrap();
+        });
+        let entries = check_invariants(&tree);
+        assert_eq!(entries.len(), 200 + 300);
     }
 
     fn in_range(k: &[u8], lo: &Bound<Vec<u8>>, hi: &Bound<Vec<u8>>) -> bool {
