@@ -37,6 +37,11 @@ pub enum BTreeError {
 
     #[error("corrupt btree: {0}")]
     Corrupt(&'static str),
+
+    /// An error from a caller-supplied callback (e.g. a unique check
+    /// reading the table).
+    #[error(transparent)]
+    External(Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Result alias for this module.

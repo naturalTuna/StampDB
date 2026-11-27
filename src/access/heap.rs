@@ -362,6 +362,52 @@ impl HeapFile {
         }
     }
 
+    /// For a unique index check: the state of the row at `tid` regardless of
+    /// any snapshot (PostgreSQL's dirty snapshot). A row inserted or deleted
+    /// by an unfinished transaction other than `me` means wait; a committed
+    /// row that is not deleted (or one `me` inserted) is live.
+    pub fn unique_check(
+        &self,
+        tid: Tid,
+        me: Option<Xid>,
+        tm: &dyn TransactionManager,
+    ) -> Result<crate::access::btree::UniqueCheck> {
+        use crate::access::btree::UniqueCheck;
+        let Some(t) = self.fetch(tid)? else {
+            return Ok(UniqueCheck::Ignore); // pruned
+        };
+        let h = TupleHeader::decode(&t)?;
+        let mask = h.infomask;
+        if Some(h.xmin) != me {
+            if mask & infomask::XMIN_INVALID != 0 {
+                return Ok(UniqueCheck::Ignore);
+            }
+            if mask & infomask::XMIN_COMMITTED == 0 {
+                match tm.status(h.xmin)? {
+                    XidStatus::InProgress => return Ok(UniqueCheck::Wait(h.xmin)),
+                    XidStatus::Aborted => return Ok(UniqueCheck::Ignore),
+                    XidStatus::Committed => {}
+                }
+            }
+        }
+        if !h.xmax.is_valid() || mask & infomask::XMAX_INVALID != 0 {
+            return Ok(UniqueCheck::Live);
+        }
+        if Some(h.xmax) == me {
+            return Ok(UniqueCheck::Ignore);
+        }
+        let status = if mask & infomask::XMAX_COMMITTED != 0 {
+            XidStatus::Committed
+        } else {
+            tm.status(h.xmax)?
+        };
+        Ok(match status {
+            XidStatus::InProgress => UniqueCheck::Wait(h.xmax),
+            XidStatus::Aborted => UniqueCheck::Live,
+            XidStatus::Committed => UniqueCheck::Ignore,
+        })
+    }
+
     /// Copies the tuple at `tid` if it is visible to `snap`.
     pub fn fetch_visible(
         &self,

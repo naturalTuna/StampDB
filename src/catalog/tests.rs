@@ -107,3 +107,191 @@ fn catalogs_survive_restart() {
             .is_some()
     );
 }
+
+fn cols() -> Vec<Column> {
+    vec![
+        Column {
+            name: "id".into(),
+            ty: DataType::Int4,
+            not_null: true,
+        },
+        Column {
+            name: "name".into(),
+            ty: DataType::Varchar(Some(10)),
+            not_null: false,
+        },
+    ]
+}
+
+fn file_exists(e: &Env, rel: RelFileId) -> bool {
+    use crate::storage::backend::FileKey;
+    e.mem.file_len(FileKey::Relation(rel)).is_ok()
+}
+
+#[test]
+fn create_table_is_transactional() {
+    let e = fresh();
+    let mut t1 = e.begin();
+    let info = e.cat.create_table(&mut t1, "t", &cols()).unwrap();
+    assert!(info.oid >= crate::wal::recovery::FIRST_OID);
+    assert_eq!(e.cat.lookup_relation(&mut t1, "t").unwrap().unwrap(), info);
+    let mut t2 = e.begin();
+    assert!(e.cat.lookup_relation(&mut t2, "t").unwrap().is_none());
+    t1.commit().unwrap();
+    t2.statement_snapshot();
+    let seen = e.cat.lookup_relation(&mut t2, "t").unwrap().unwrap();
+    assert_eq!(seen.columns, cols());
+    assert!(file_exists(&e, info.rel));
+}
+
+#[test]
+fn rolled_back_create_disappears() {
+    let e = fresh();
+    let mut t = e.begin();
+    let info = e.cat.create_table(&mut t, "gone", &cols()).unwrap();
+    t.abort().unwrap();
+    let mut r = e.begin();
+    assert!(e.cat.lookup_relation(&mut r, "gone").unwrap().is_none());
+    assert!(!file_exists(&e, info.rel));
+}
+
+#[test]
+fn duplicate_name_is_rejected() {
+    let e = fresh();
+    let mut t = e.begin();
+    e.cat.create_table(&mut t, "a", &cols()).unwrap();
+    t.commit().unwrap();
+    let mut t = e.begin();
+    assert!(matches!(
+        e.cat.create_table(&mut t, "a", &cols()),
+        Err(CatalogError::DuplicateRelation(n)) if n == "a"
+    ));
+    t.abort().unwrap();
+    let mut t = e.begin();
+    assert!(matches!(
+        e.cat.create_table(&mut t, "sys_class", &cols()),
+        Err(CatalogError::DuplicateRelation(_))
+    ));
+}
+
+#[test]
+fn concurrent_create_waits_for_the_other_transaction() {
+    for first_commits in [true, false] {
+        let e = fresh();
+        let mut t1 = e.begin();
+        e.cat.create_table(&mut t1, "x", &cols()).unwrap();
+        let r = std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                let mut t2 = e.begin();
+                let r = e.cat.create_table(&mut t2, "x", &cols()).map(|_| ());
+                match &r {
+                    Ok(()) => t2.commit().unwrap(),
+                    Err(_) => t2.abort().unwrap(),
+                }
+                r
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if first_commits {
+                t1.commit().unwrap();
+            } else {
+                t1.abort().unwrap();
+            }
+            h.join().unwrap()
+        });
+        if first_commits {
+            assert!(matches!(r, Err(CatalogError::DuplicateRelation(_))));
+        } else {
+            assert!(r.is_ok(), "{r:?}");
+        }
+        let mut t = e.begin();
+        assert!(e.cat.lookup_relation(&mut t, "x").unwrap().is_some());
+    }
+}
+
+#[test]
+fn drop_table_is_transactional() {
+    let e = fresh();
+    let mut t = e.begin();
+    let info = e.cat.create_table(&mut t, "d", &cols()).unwrap();
+    t.commit().unwrap();
+
+    let mut t = e.begin();
+    e.cat.drop_table(&mut t, "d").unwrap();
+    assert!(e.cat.lookup_relation(&mut t, "d").unwrap().is_none());
+    t.abort().unwrap();
+    let mut r = e.begin();
+    assert!(
+        e.cat.lookup_relation(&mut r, "d").unwrap().is_some(),
+        "drop rolled back"
+    );
+    assert!(file_exists(&e, info.rel));
+    drop(r);
+
+    let mut t = e.begin();
+    e.cat.drop_table(&mut t, "d").unwrap();
+    t.commit().unwrap();
+    assert!(!file_exists(&e, info.rel));
+    let mut r = e.begin();
+    assert!(e.cat.lookup_relation(&mut r, "d").unwrap().is_none());
+    assert!(matches!(
+        e.cat.drop_table(&mut r, "d"),
+        Err(CatalogError::UndefinedRelation(_))
+    ));
+    drop(r);
+
+    // The name can be reused.
+    let mut t = e.begin();
+    let again = e.cat.create_table(&mut t, "d", &cols()).unwrap();
+    assert_ne!(again.oid, info.oid);
+    t.commit().unwrap();
+}
+
+#[test]
+fn drop_waits_for_readers() {
+    let e = fresh();
+    let mut t = e.begin();
+    let info = e.cat.create_table(&mut t, "busy", &cols()).unwrap();
+    t.commit().unwrap();
+    let reader = e.begin();
+    reader
+        .lock_relation(RelFileId(info.oid), LockMode::AccessShare)
+        .unwrap();
+    let dropped = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut t = e.begin();
+            e.cat.drop_table(&mut t, "busy").unwrap();
+            t.commit().unwrap();
+            dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "blocked by the reader"
+        );
+        reader.commit().unwrap();
+    });
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn ddl_after_crash() {
+    let e = fresh();
+    let mut t = e.begin();
+    e.cat.create_table(&mut t, "kept", &cols()).unwrap();
+    t.commit().unwrap();
+    let mut open = e.begin();
+    e.cat.create_table(&mut open, "lost", &cols()).unwrap();
+    let mem = e.mem.clone();
+    std::mem::forget(open); // crash with the CREATE uncommitted
+    drop(e);
+    let e = start(&mem);
+    let mut r = e.begin();
+    assert!(e.cat.lookup_relation(&mut r, "kept").unwrap().is_some());
+    assert!(e.cat.lookup_relation(&mut r, "lost").unwrap().is_none());
+    // The name is free again (the crashed creator counts as aborted).
+    drop(r);
+    let mut t = e.begin();
+    e.cat.create_table(&mut t, "lost", &cols()).unwrap();
+    t.commit().unwrap();
+}

@@ -13,11 +13,13 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::access::btree::key::{KeyError, encode_key};
-use crate::access::btree::{BTree, BTreeError};
+use crate::access::btree::{BTree, BTreeError, InsertOutcome};
+use crate::access::heap::TmResult;
 use crate::access::heap::{HeapError, HeapFile};
 use crate::access::tuple::{Tid, TupleDesc, TupleError, deform_tuple, form_tuple};
 use crate::access::visibility::Me;
 use crate::buffer::FlushControl;
+use crate::lock::LockMode;
 use crate::storage::backend::{FenceSource, RelFileId, StorageBackend};
 use crate::txn::{CommandId, Transaction, TransactionError, Xid};
 use crate::types::{DataType, Value};
@@ -323,6 +325,157 @@ impl Catalog {
             }
         }
         Ok(out)
+    }
+
+    /// Inserts a catalog row for `txn`, checking its unique system indexes
+    /// (waiting for transactions whose rows are in flux). On a duplicate,
+    /// the transaction must be aborted (its heap row is left behind).
+    fn insert_row_checked(
+        &self,
+        txn: &mut Transaction,
+        table: RelFileId,
+        row: &[Value],
+        what: &str,
+    ) -> Result<Tid> {
+        let xid = txn.write_xid()?;
+        let t = form_tuple(&desc_of(table)?, row, xid, txn.command_id())?;
+        let heap = self.heap(table)?;
+        let tid = heap.insert(&t)?;
+        for (idx, tree) in &self.indexes {
+            if idx.table != table {
+                continue;
+            }
+            let key = Self::key_for(idx, row)?;
+            if !idx.unique {
+                tree.insert(&key, tid)?;
+                continue;
+            }
+            loop {
+                let check = |t| {
+                    heap.unique_check(t, Some(xid), txn.tm())
+                        .map_err(|e| BTreeError::External(Box::new(e)))
+                };
+                match tree.insert_unique(&key, tid, &check)? {
+                    InsertOutcome::Inserted => break,
+                    InsertOutcome::Duplicate => {
+                        return Err(CatalogError::DuplicateRelation(what.to_owned()));
+                    }
+                    InsertOutcome::Wait(x) => txn.wait_for(x)?,
+                }
+            }
+        }
+        Ok(tid)
+    }
+
+    /// Creates table `name` within `txn` (visible to others once `txn`
+    /// commits; its file is deleted if `txn` aborts).
+    pub fn create_table(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        columns: &[Column],
+    ) -> Result<RelationInfo> {
+        txn.write_xid()?;
+        let oid = self.engine.allocate_oid()?;
+        let rel = RelFileId(oid);
+        self.insert_row_checked(
+            txn,
+            SYS_CLASS,
+            &class_row(oid, name, RELKIND_TABLE, rel, columns.len()),
+            name,
+        )?;
+        for (i, c) in columns.iter().enumerate() {
+            self.insert_row_checked(
+                txn,
+                SYS_ATTRIBUTE,
+                &attribute_row(oid, i + 1, &c.name, c.ty, c.not_null),
+                name,
+            )?;
+        }
+        self.engine.create_relation(rel)?;
+        txn.drop_on_abort(rel);
+        txn.lock_relation(rel, LockMode::AccessExclusive)?;
+        txn.next_command();
+        Ok(RelationInfo {
+            oid,
+            name: name.to_owned(),
+            kind: RelKind::Table,
+            rel,
+            columns: columns.to_vec(),
+        })
+    }
+
+    /// Drops table `name` and its indexes within `txn` (files are deleted
+    /// when `txn` commits).
+    pub fn drop_table(&self, txn: &mut Transaction, name: &str) -> Result<()> {
+        let info = self
+            .lookup_relation(txn, name)?
+            .filter(|r| r.kind == RelKind::Table)
+            .ok_or_else(|| CatalogError::UndefinedRelation(name.to_owned()))?;
+        txn.lock_relation(RelFileId(info.oid), LockMode::AccessExclusive)?;
+        // It may have been dropped while we waited for the lock.
+        txn.statement_snapshot();
+        let info = self
+            .lookup_relation(txn, name)?
+            .filter(|r| r.kind == RelKind::Table && r.oid == info.oid)
+            .ok_or_else(|| CatalogError::UndefinedRelation(name.to_owned()))?;
+        for idx in self.indexes_of(txn, info.oid)? {
+            self.drop_index_rows(txn, idx.oid)?;
+            txn.drop_on_commit(idx.rel);
+        }
+        let oid = Value::Int8(i64::from(info.oid));
+        for (tid, _) in self.lookup(
+            txn,
+            SYS_ATTRIBUTE_RELID_ATTNUM_INDEX,
+            &[DataType::Int8],
+            std::slice::from_ref(&oid),
+        )? {
+            self.delete_row(txn, SYS_ATTRIBUTE, tid)?;
+        }
+        for (tid, _) in self.lookup(txn, SYS_CLASS_OID_INDEX, &[DataType::Int8], &[oid])? {
+            self.delete_row(txn, SYS_CLASS, tid)?;
+        }
+        txn.drop_on_commit(info.rel);
+        txn.next_command();
+        Ok(())
+    }
+
+    /// Deletes the sys_index and sys_class rows of index `oid`.
+    fn drop_index_rows(&self, txn: &mut Transaction, oid: u32) -> Result<()> {
+        let v = Value::Int8(i64::from(oid));
+        for (tid, _) in self.lookup(
+            txn,
+            SYS_CLASS_OID_INDEX,
+            &[DataType::Int8],
+            std::slice::from_ref(&v),
+        )? {
+            self.delete_row(txn, SYS_CLASS, tid)?;
+        }
+        // sys_index has no index on indexrelid: scan its rows for the table.
+        let heap = self.heap(SYS_INDEX)?;
+        let snap = txn.snapshot();
+        let me = Me {
+            xid: txn.xid(),
+            cid: txn.command_id(),
+        };
+        let mut tids = Vec::new();
+        for r in heap.scan_mvcc(snap, me, txn.tm())? {
+            let (tid, row) = r?;
+            if int(&deform_tuple(&index_desc(), &row)?, 0)? == i64::from(oid) {
+                tids.push(tid);
+            }
+        }
+        for tid in tids {
+            self.delete_row(txn, SYS_INDEX, tid)?;
+        }
+        Ok(())
+    }
+
+    fn delete_row(&self, txn: &mut Transaction, table: RelFileId, tid: Tid) -> Result<()> {
+        match self.heap(table)?.delete_waiting(tid, txn)? {
+            TmResult::Ok(_) => Ok(()),
+            _ => Err(CatalogError::Corrupt("catalog row changed concurrently")),
+        }
     }
 
     /// The relation named `name`, as `txn` sees the catalogs.
