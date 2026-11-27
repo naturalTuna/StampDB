@@ -4,6 +4,10 @@
 decisions의 변경은 채팅 리뷰를 거친 뒤에만 반영하고, 반영 시 아래 변경 이력에 남긴다.
 
 ## 변경 이력
+- r3 (2026-11-27)
+  - [수정] Direct I/O 세부: 디바이스 논리 블록 크기 확인을 BLKSSZGET에서 sysfs(`/sys/dev/block/<major>:<minor>/queue/logical_block_size`)로 변경. 값을 구할 수 없으면 기동 거부.
+  - [추가] 페이지 체크섬 알고리즘: CRC32C(32비트), 블록 번호 포함.
+  - [추가] 파일 접근 trait의 sync(fdatasync)는 fencing 토큰을 받지 않음.
 - r2 (2026-11-27)
   - [수정] fencing: epoch 검사를 WAL flush뿐 아니라 공유 스토리지에 대한 모든 쓰기로 확장. 파일 접근 trait의 쓰기에 fencing 토큰 전달. lease 방식의 한계(TOCTOU)를 명시.
   - [추가] hint bit 정책: 체크포인트 후 첫 hint 변경 시 FPI 기록, 커밋 레코드 flush 후에만 설정, 가시성 판단은 스냅샷 우선.
@@ -75,8 +79,10 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - I/O는 pread/pwrite + O_DIRECT를 사용한다. io_uring은 사용하지 않는다.
   근거: RHEL 9 계열은 io_uring을 기본적으로 비활성화하고 있다.
 - Direct I/O 세부:
-  - 정렬 단위는 4096 바이트로 고정하고, 시작 시 BLKSSZGET으로 디바이스 논리 블록 크기를 확인해 4096을 넘으면 기동을 거부한다.
+  - 정렬 단위는 4096 바이트로 고정하고, 시작 시 데이터 디렉토리가 있는 디바이스의 논리 블록 크기를 확인해 4096을 넘거나 4096의 약수가 아니면 기동을 거부한다.
     근거: EL9 커널(5.14)에는 statx의 STATX_DIOALIGN이 없다.
+  - 논리 블록 크기는 데이터 디렉토리의 st_dev로 sysfs(`/sys/dev/block/<major>:<minor>/queue/logical_block_size`, 파티션이면 상위 디스크의 queue)를 읽어 구한다. 값을 구할 수 없으면(NFS, tmpfs 등) 기동을 거부한다.
+    근거: BLKSSZGET은 블록 디바이스를 직접 열어야 하므로 root 또는 disk 그룹 권한이 필요하다. sysfs는 일반 사용자로 읽을 수 있고 dm/LVM 장치에서도 동작한다.
   - O_DIRECT여도 디바이스 쓰기 캐시와 파일 메타데이터 때문에 내구성 지점에서는 fdatasync(필요 시 fsync, 디렉토리 fsync)를 호출한다.
   - WAL을 O_DIRECT로 쓸 때 마지막 부분 블록은 패딩해 블록 단위로 쓰고, 이후 같은 블록을 다시 쓴다.
 - 설치 모드는 설정으로 구분한다: single(단일 노드) / ha(공유 스토리지 + 복제).
@@ -114,6 +120,8 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - 페이지 헤더에 page LSN을 둔다 (WAL 적용 여부 판단 및 reader 재생에 사용).
 - 한 페이지에 들어가지 않는 튜플은 overflow 처리(TOAST 유사)를 둔다. 초기에는 최대 크기 제한으로 대체 가능.
 - 페이지 체크섬 사용. torn page 대응(full page write)은 디바이스의 원자적 쓰기 보장에 기대지 않고 유지한다.
+  - 알고리즘은 CRC32C(32비트). 체크섬 필드를 0으로 둔 페이지 전체와 블록 번호를 함께 계산한다. 전부 0인 페이지는 새 페이지로 보고 검사를 통과시킨다.
+    근거: x86_64에서 SSE4.2 하드웨어 가속을 받고, PG의 16비트 FNV 변형보다 검출력이 높다. 블록 번호를 섞어 엉뚱한 위치에 쓰인 페이지를 검출한다 (PG와 동일).
 - hint bit 정책:
   - 체크포인트 이후 페이지의 첫 hint bit 변경 시 full page image를 WAL에 기록한다 (PG의 wal_log_hints / 체크섬 사용 시 동작과 동일).
     근거: WAL 없이 바뀐 페이지가 torn 상태로 쓰이면 체크섬 오류를 FPW로 복구할 수 없다. 또한 LSN이 전진해야 ha 모드의 flush 제약이 적용된다.
@@ -124,6 +132,8 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
   근거: 로컬 디렉토리, 클러스터 파일시스템, 블록 디바이스 직접 관리 등으로 교체할 수 있게 하기 위함.
   - 모든 쓰기 연산은 fencing 토큰(epoch)을 인자로 받는다. single 모드 구현은 무시하고, ha 모드 구현은 쓰기 직전에 검사한다.
     근거: 이후 스토리지 레벨 fencing(SCSI-3 PR, NVMe reservation, 스토리지 측 epoch 검증)을 끼울 자리를 처음부터 확보한다.
+  - sync(fdatasync)는 fencing 토큰을 받지 않는다.
+    근거: sync는 새 데이터를 만들지 않고, 이미 토큰 검사를 거친 쓰기를 내구화할 뿐이다.
 
 [B+Tree]
 - Lehman-Yao 방식: 각 페이지에 right-link와 high key를 둔다. 하강 시 한 번에 하나의 latch만 잡는다.
