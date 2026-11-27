@@ -41,6 +41,7 @@ use crate::access::tuple::Tid;
 use crate::buffer::{BufferPool, BufferTag, PageMut, PinGuard};
 use crate::storage::backend::RelFileId;
 use crate::storage::page::BlockNumber;
+use crate::txn::Xid;
 use crate::wal::log_and_stamp;
 use crate::wal::record::{BlockRef, Record, RmgrId};
 
@@ -75,6 +76,36 @@ pub mod info {
     pub const SPLIT_HAS_SIBLING: u8 = 0x01;
     /// SPLIT main-data flag: a child block follows.
     pub const SPLIT_HAS_CHILD: u8 = 0x02;
+}
+
+/// What the table says about the row an existing entry with the same key
+/// points to (for unique checks; PostgreSQL checks with a dirty snapshot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniqueCheck {
+    /// The row exists (committed, or written by the inserting transaction):
+    /// the new key would be a duplicate.
+    Live,
+    /// The row is dead or was never committed: not a conflict.
+    Ignore,
+    /// A transaction that has not finished inserted or deleted the row:
+    /// wait for it, then check again.
+    Wait(Xid),
+}
+
+/// Result of [`BTree::insert_unique`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    Inserted,
+    Duplicate,
+    /// Nothing was inserted; wait for this transaction, then retry.
+    Wait(Xid),
+}
+
+/// Progress of a unique insert along the chain of pages with the key.
+enum Chain {
+    Done(InsertOutcome),
+    /// The entry belongs to a page further left.
+    NotYet,
 }
 
 /// Next step of a descent.
@@ -196,6 +227,123 @@ impl BTree {
                 return self.insert_item(&pin, page, blk, pos, entry, &mut stack, None);
             }
         }
+    }
+
+    /// Inserts `key || tid` unless another entry with the same key points
+    /// at a row `check` reports live (PostgreSQL's _bt_check_unique).
+    ///
+    /// The search uses the key alone to find the first leaf that can hold
+    /// it and walks right, locking page after page (left to right) while
+    /// equal keys continue; the entry is inserted into the right one of
+    /// those pages while they are all still locked, so a concurrent insert
+    /// of the same key must see it. On `Wait`, nothing was inserted and no
+    /// lock is held.
+    pub fn insert_unique(
+        &self,
+        key: &[u8],
+        tid: Tid,
+        check: &dyn Fn(Tid) -> Result<UniqueCheck>,
+    ) -> Result<InsertOutcome> {
+        let entry = entry_key(key, tid)?;
+        'restart: loop {
+            let (mut pin, mut blk, stack) = self.descend(key)?;
+            loop {
+                let mut page = pin.write();
+                let (incomplete, move_right, next) = {
+                    let node = Node::open(&page[..])?;
+                    (
+                        node.opaque().flags & flags::INCOMPLETE_SPLIT != 0,
+                        node.must_move_right(key)?,
+                        node.opaque().next,
+                    )
+                };
+                if incomplete {
+                    self.finish_split(blk, &mut page, 0, stack.clone())?;
+                    continue 'restart;
+                }
+                if move_right {
+                    drop(page);
+                    blk = next;
+                    pin = self.fetch(next)?;
+                    continue;
+                }
+                return match self.unique_chain(&pin, page, blk, None, key, &entry, &stack, check)? {
+                    Chain::Done(r) => Ok(r),
+                    Chain::NotYet => Err(BTreeError::Corrupt("no page accepted the unique entry")),
+                };
+            }
+        }
+    }
+
+    /// One page of the unique-key chain: checks this page's entries with
+    /// `key`, continues right (still holding this page) while the key may
+    /// continue, then inserts here if the entry belongs to this page.
+    /// `low` is the previous page's high key (this page's lower bound).
+    #[allow(clippy::too_many_arguments)]
+    fn unique_chain(
+        &self,
+        pin: &PinGuard<'_>,
+        page: PageMut<'_>,
+        blk: u32,
+        low: Option<Vec<u8>>,
+        key: &[u8],
+        entry: &[u8],
+        stack: &[u32],
+        check: &dyn Fn(Tid) -> Result<UniqueCheck>,
+    ) -> Result<Chain> {
+        let (ignored, high, next, more) = {
+            let node = Node::open(&page[..])?;
+            let op = node.opaque();
+            let ignored = op.flags & (flags::HALF_DEAD | flags::DELETED) != 0;
+            let mut ended = false;
+            if !ignored {
+                for s in node.lower_bound(key)?..node.slot_count() {
+                    let e = node.key_at(s)?;
+                    let cut = e
+                        .len()
+                        .checked_sub(TID_LEN)
+                        .ok_or(BTreeError::Corrupt("leaf entry shorter than tid"))?;
+                    if &e[..cut] != key {
+                        ended = true;
+                        break;
+                    }
+                    if e == entry {
+                        return Err(BTreeError::Duplicate);
+                    }
+                    match check(decode_tid(&e[cut..])?)? {
+                        UniqueCheck::Live => return Ok(Chain::Done(InsertOutcome::Duplicate)),
+                        UniqueCheck::Wait(x) => return Ok(Chain::Done(InsertOutcome::Wait(x))),
+                        UniqueCheck::Ignore => {}
+                    }
+                }
+            }
+            let high = node.high_key()?.map(<[u8]>::to_vec);
+            let key_continues = high
+                .as_ref()
+                .is_some_and(|h| h.len() >= TID_LEN && &h[..h.len() - TID_LEN] == key);
+            let more = !op.is_rightmost() && (ignored || (!ended && key_continues));
+            (ignored, high, op.next, more)
+        };
+        if more {
+            let rpin = self.fetch(next)?;
+            let rpage = rpin.write();
+            let rlow = if ignored { low.clone() } else { high.clone() };
+            if let Chain::Done(r) =
+                self.unique_chain(&rpin, rpage, next, rlow, key, entry, stack, check)?
+            {
+                return Ok(Chain::Done(r));
+            }
+        }
+        let belongs = !ignored
+            && low.as_ref().is_none_or(|l| entry >= l.as_slice())
+            && high.as_ref().is_none_or(|h| entry < h.as_slice());
+        if !belongs {
+            return Ok(Chain::NotYet);
+        }
+        let pos = Node::open(&page[..])?.lower_bound(entry)?;
+        let mut stack = stack.to_vec();
+        self.insert_item(pin, page, blk, pos, entry.to_vec(), &mut stack, None)?;
+        Ok(Chain::Done(InsertOutcome::Inserted))
     }
 
     /// Removes the entry `key || tid`. Returns whether it existed.
@@ -1886,6 +2034,105 @@ mod tests {
         });
         let entries = check_invariants(&tree);
         assert_eq!(entries.len(), 200 + 300);
+    }
+
+    #[test]
+    fn unique_insert_outcomes() {
+        let (_mem, _pool, tree) = setup_wal();
+        let live = |_: Tid| Ok(UniqueCheck::Live);
+        let dead = |_: Tid| Ok(UniqueCheck::Ignore);
+        assert_eq!(
+            tree.insert_unique(&key(1, 0), tid(1), &live).unwrap(),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(
+            tree.insert_unique(&key(1, 0), tid(2), &live).unwrap(),
+            InsertOutcome::Duplicate
+        );
+        let waiting = |_: Tid| Ok(UniqueCheck::Wait(Xid(77)));
+        assert_eq!(
+            tree.insert_unique(&key(1, 0), tid(2), &waiting).unwrap(),
+            InsertOutcome::Wait(Xid(77))
+        );
+        assert_eq!(
+            tree.insert_unique(&key(1, 0), tid(2), &dead).unwrap(),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(
+            tree.insert_unique(&key(2, 0), tid(3), &live).unwrap(),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(all(&tree).len(), 3);
+    }
+
+    #[test]
+    fn unique_check_spans_pages_of_dead_duplicates() {
+        let (_mem, _pool, tree) = setup_wal();
+        for i in 0..200u32 {
+            tree.insert(&key(i as i64, 0), tid(i)).unwrap();
+        }
+        // Hundreds of dead versions of key 100, spreading over many pages.
+        for t in 1000..1600u32 {
+            tree.insert(&key(100, 300), tid(t)).unwrap();
+        }
+        let live_one = Tid {
+            blk: BlockNumber(900), // not among the tids above
+            slot: SlotId(0),
+        };
+        let checked = std::sync::Mutex::new(0usize);
+        let only_one_live = |t: Tid| {
+            *checked.lock().unwrap() += 1;
+            Ok(if t == live_one {
+                UniqueCheck::Live
+            } else {
+                UniqueCheck::Ignore
+            })
+        };
+        // A new version lands among them after checking all of them.
+        let r = tree
+            .insert_unique(&key(100, 300), tid(5000), &only_one_live)
+            .unwrap();
+        assert_eq!(r, InsertOutcome::Inserted);
+        assert_eq!(*checked.lock().unwrap(), 600);
+        // With one live version at the far end of the chain: duplicate.
+        tree.insert(&key(100, 300), live_one).unwrap();
+        let r = tree
+            .insert_unique(&key(100, 300), tid(6000), &only_one_live)
+            .unwrap();
+        assert_eq!(r, InsertOutcome::Duplicate);
+        check_invariants(&tree);
+    }
+
+    #[test]
+    fn concurrent_unique_inserts_admit_one_per_key() {
+        let (_pool, tree) = concurrent_setup(4);
+        let live = |_: Tid| Ok(UniqueCheck::Live);
+        let wins: Vec<usize> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..4u32)
+                .map(|t| {
+                    let (tree, live) = (&tree, &live);
+                    s.spawn(move || {
+                        (0..300u32)
+                            .filter(|&k| {
+                                let r = tree.insert_unique(
+                                    &key(k as i64, 100),
+                                    tid(t * 1000 + k),
+                                    live,
+                                );
+                                fail_on_exhausted(r, "unique insert") == InsertOutcome::Inserted
+                            })
+                            .count()
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(
+            wins.iter().sum::<usize>(),
+            300,
+            "exactly one insert per key"
+        );
+        assert_eq!(check_invariants(&tree).len(), 300);
     }
 
     fn in_range(k: &[u8], lo: &Bound<Vec<u8>>, hi: &Bound<Vec<u8>>) -> bool {
