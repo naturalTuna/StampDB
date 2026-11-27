@@ -12,6 +12,11 @@
 //! the lock. On release, waiters are granted in queue order as far as
 //! possible (PostgreSQL's ProcLockWakeup).
 //!
+//! A wait that lasts `deadlock_timeout` checks the wait-for graph once; if
+//! the waiter is in a cycle, its request fails with [`LockError::Deadlock`]
+//! (PostgreSQL's deadlock_timeout and DeadLockCheck; the requester is the
+//! victim). Latches are never part of this graph (DESIGN).
+//!
 //! The table is one mutex with one condition variable; PostgreSQL
 //! partitions it 16 ways. Deadlock detection needs a consistent view of all
 //! waits, which one mutex gives directly.
@@ -170,11 +175,23 @@ impl LockManager {
         });
         let start = Instant::now();
         let deadline = policy.lock_timeout.map(|t| start + t);
+        let mut deadlock_check = Some(start + policy.deadlock_timeout);
         loop {
             if granted.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            let now = Instant::now();
+            let failure = if deadline.is_some_and(|d| now >= d) {
+                Some(LockError::Timeout)
+            } else if deadlock_check.is_some_and(|d| now >= d) {
+                // Checked once, like PostgreSQL: a cycle completed later is
+                // found by the waiter whose wait completes it.
+                deadlock_check = None;
+                Self::in_cycle(&table, owner).then_some(LockError::Deadlock)
+            } else {
+                None
+            };
+            if let Some(err) = failure {
                 Self::cancel_wait(&mut table, tag, &granted);
                 // Our departure may unblock waiters queued behind us.
                 if table.get_mut(&tag).is_some_and(LockState::wake) {
@@ -183,16 +200,56 @@ impl LockManager {
                 return if granted.load(Ordering::SeqCst) {
                     Ok(())
                 } else {
-                    Err(LockError::Timeout)
+                    Err(err)
                 };
             }
-            match deadline {
+            match [deadline, deadlock_check].into_iter().flatten().min() {
                 Some(d) => {
                     self.cv.wait_until(&mut table, d);
                 }
                 None => self.cv.wait(&mut table),
             }
         }
+    }
+
+    /// Whether `me` waits in a cycle of the wait-for graph. An owner waits
+    /// for every other owner holding a conflicting mode on the lock it is
+    /// queued for, and for every conflicting waiter queued ahead of it.
+    fn in_cycle(table: &HashMap<LockTag, LockState>, me: TxnId) -> bool {
+        let mut edges: HashMap<TxnId, Vec<TxnId>> = HashMap::new();
+        for state in table.values() {
+            for (i, w) in state.waiters.iter().enumerate() {
+                let out = edges.entry(w.owner).or_default();
+                for (holder, counts) in &state.holders {
+                    if *holder != w.owner
+                        && LockMode::ALL
+                            .iter()
+                            .any(|m| counts[m.index()] > 0 && w.mode.conflicts(*m))
+                    {
+                        out.push(*holder);
+                    }
+                }
+                for ahead in state.waiters.iter().take(i) {
+                    if ahead.owner != w.owner && w.mode.conflicts(ahead.mode) {
+                        out.push(ahead.owner);
+                    }
+                }
+            }
+        }
+        // Depth-first search for a path from `me` back to `me`.
+        let mut stack: Vec<TxnId> = edges.get(&me).cloned().unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(t) = stack.pop() {
+            if t == me {
+                return true;
+            }
+            if seen.insert(t)
+                && let Some(next) = edges.get(&t)
+            {
+                stack.extend(next.iter().copied());
+            }
+        }
+        false
     }
 
     /// Removes our queued request (if not granted meanwhile).

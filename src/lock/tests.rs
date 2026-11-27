@@ -163,3 +163,112 @@ fn many_threads_mutual_exclusion() {
     });
     assert!(lm.table.lock().is_empty(), "entries are cleaned up");
 }
+
+fn fast_deadlock() -> WaitPolicy {
+    WaitPolicy {
+        lock_timeout: Some(Duration::from_secs(10)),
+        deadlock_timeout: Duration::from_millis(50),
+    }
+}
+
+#[test]
+fn two_way_deadlock_is_detected() {
+    let lm = LockManager::new();
+    let a = LockTag::Relation(RelFileId(1));
+    let b = LockTag::Relation(RelFileId(2));
+    lm.acquire(T1, a, LockMode::Exclusive, no_wait()).unwrap();
+    lm.acquire(T2, b, LockMode::Exclusive, no_wait()).unwrap();
+    let barrier = Barrier::new(2);
+    let results = std::thread::scope(|s| {
+        let h1 = s.spawn(|| {
+            barrier.wait();
+            let r = lm.acquire(T1, b, LockMode::Exclusive, fast_deadlock());
+            lm.release_all(T1); // victim or winner: end the transaction
+            r
+        });
+        let h2 = s.spawn(|| {
+            barrier.wait();
+            let r = lm.acquire(T2, a, LockMode::Exclusive, fast_deadlock());
+            lm.release_all(T2);
+            r
+        });
+        [h1.join().unwrap(), h2.join().unwrap()]
+    });
+    let deadlocks = results
+        .iter()
+        .filter(|r| **r == Err(LockError::Deadlock))
+        .count();
+    let oks = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!((deadlocks, oks), (1, 1), "{results:?}");
+}
+
+#[test]
+fn three_way_cycle_through_transaction_locks() {
+    // T1 waits for T2's xid, T2 for T3's xid, T3 for T1's xid.
+    let lm = LockManager::new();
+    let xs = [Xid(101), Xid(102), Xid(103)];
+    let owners = [T1, T2, T3];
+    for (o, x) in owners.iter().zip(xs) {
+        lm.acquire(*o, LockTag::Transaction(x), LockMode::Exclusive, no_wait())
+            .unwrap();
+    }
+    let barrier = Barrier::new(3);
+    let results: Vec<Result<()>> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..3)
+            .map(|i| {
+                let (lm, barrier) = (&lm, &barrier);
+                s.spawn(move || {
+                    barrier.wait();
+                    let r = lm.wait_for_xid(owners[i], xs[(i + 1) % 3], fast_deadlock());
+                    lm.release_all(owners[i]);
+                    r
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let deadlocks = results
+        .iter()
+        .filter(|r| **r == Err(LockError::Deadlock))
+        .count();
+    assert!(deadlocks >= 1, "{results:?}");
+    assert!(
+        results.iter().any(Result::is_ok),
+        "the others proceed: {results:?}"
+    );
+}
+
+#[test]
+fn plain_wait_is_not_a_deadlock() {
+    let lm = LockManager::new();
+    lm.acquire(T1, REL, LockMode::Exclusive, no_wait()).unwrap();
+    std::thread::scope(|s| {
+        let h = s.spawn(|| lm.acquire(T2, REL, LockMode::Exclusive, fast_deadlock()));
+        std::thread::sleep(Duration::from_millis(150)); // past deadlock_timeout
+        lm.release_all(T1);
+        assert_eq!(h.join().unwrap(), Ok(()));
+    });
+}
+
+#[test]
+fn holder_upgrade_skips_the_queue_without_deadlock() {
+    // T1 holds Share and T2 queues for Exclusive behind it. T1 then asks
+    // for Exclusive: no other owner holds the lock, and a holder is not
+    // made to wait behind the queue, so T1 proceeds instead of the two
+    // waiting for each other.
+    let lm = LockManager::new();
+    lm.acquire(T1, REL, LockMode::Share, no_wait()).unwrap();
+    std::thread::scope(|s| {
+        let h2 = s.spawn(|| {
+            let r = lm.acquire(T2, REL, LockMode::Exclusive, fast_deadlock());
+            lm.release_all(T2);
+            r
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        // Upgrade conflicts with no other holder; queue skip applies.
+        lm.acquire(T1, REL, LockMode::Exclusive, fast_deadlock())
+            .unwrap();
+        lm.release_all(T1);
+        assert_eq!(h2.join().unwrap(), Ok(()));
+    });
+}
