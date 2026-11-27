@@ -23,13 +23,18 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use super::tuple::infomask;
 use super::tuple::{self, MAX_TUPLE_SIZE, Tid, TupleError, TupleHeader};
+use super::visibility::{Me, satisfies_mvcc};
 use crate::buffer::{BufferError, BufferPool, BufferTag, PageMut};
 use crate::storage::StorageError;
 use crate::storage::backend::RelFileId;
 use crate::storage::page::{BlockNumber, PageKind, is_new_page};
 use crate::storage::slotted::{SlotId, SlottedPage};
-use crate::txn::{CommandId, Xid};
+use crate::txn::{
+    CommandId, Isolation, Snapshot, Transaction, TransactionError, TransactionManager, TxnError,
+    Xid, XidStatus,
+};
 use crate::wal::log_and_stamp;
 use crate::wal::record::{BlockRef, Record, RmgrId};
 
@@ -69,6 +74,12 @@ pub enum HeapError {
 
     #[error("heap redo failed: {0}")]
     Redo(&'static str),
+
+    #[error(transparent)]
+    Transaction(#[from] TransactionError),
+
+    #[error(transparent)]
+    Txn(#[from] TxnError),
 }
 
 /// Result alias for this module.
@@ -131,37 +142,109 @@ impl HeapFile {
         Ok(p.get_item(tid.slot).map(<[u8]>::to_vec))
     }
 
-    /// Marks the tuple deleted by `xmax`.
+    /// Marks the tuple deleted by `xmax` (no visibility checks; an existing
+    /// xmax is an error). See [`HeapFile::delete_mvcc`] for transactions.
     pub fn delete(&self, tid: Tid, xmax: Xid, cmax: CommandId) -> Result<()> {
+        match self.delete_checked(tid, xmax, cmax, &|page| {
+            check_updatable(page, tid).map(|()| None)
+        })? {
+            TmResult::Ok(_) => Ok(()),
+            _ => Err(HeapError::Redo("unexpected update result")),
+        }
+    }
+
+    /// Deletes the tuple at `tid` for `txn` if it may (PostgreSQL's
+    /// heap_delete with HeapTupleSatisfiesUpdate). Does not wait; see
+    /// [`HeapFile::delete_waiting`].
+    pub fn delete_mvcc(&self, tid: Tid, txn: &mut Transaction) -> Result<TmResult> {
+        let xid = txn.write_xid()?;
+        let cid = txn.command_id();
+        let tm = txn.tm();
+        self.delete_checked(tid, xid, cid, &|page| {
+            satisfies_update(page, tid, xid, cid, tm)
+        })
+    }
+
+    fn delete_checked(
+        &self,
+        tid: Tid,
+        xmax: Xid,
+        cmax: CommandId,
+        check: &dyn Fn(&[u8]) -> Result<Option<TmResult>>,
+    ) -> Result<TmResult> {
         let pin = self.pool.fetch(self.tag(tid.blk))?;
         let mut page = pin.write();
+        if let Some(r) = check(&page)? {
+            return Ok(r);
+        }
         stamp_xmax(&mut page, tid, xmax, cmax, None)?;
         let mut b = BlockRef::new(self.rel, tid.blk);
         b.data = xmax_data(tid.slot, xmax, cmax);
-        self.log1(Record::new(RmgrId::Heap, info::DELETE), b, &mut page);
-        Ok(())
+        let mut rec = Record::new(RmgrId::Heap, info::DELETE);
+        rec.xid = xmax;
+        self.log1(rec, b, &mut page);
+        Ok(TmResult::Ok(tid))
     }
 
     /// Inserts `new_tuple` as the next version of `tid`, marking the old one
-    /// deleted by `xid` with its ctid pointing at the new version.
-    ///
+    /// deleted by `xid` with its ctid pointing at the new version (no
+    /// visibility checks; an existing xmax is an error). See
+    /// [`HeapFile::update_mvcc`] for transactions.
+    pub fn update(&self, tid: Tid, new_tuple: &[u8], xid: Xid, cid: CommandId) -> Result<Tid> {
+        match self.update_checked(tid, new_tuple, xid, cid, &|page| {
+            check_updatable(page, tid).map(|()| None)
+        })? {
+            TmResult::Ok(t) => Ok(t),
+            _ => Err(HeapError::Redo("unexpected update result")),
+        }
+    }
+
+    /// Updates the tuple at `tid` for `txn` if it may. `new_tuple` must be
+    /// formed with `txn`'s xid and command id. Does not wait; see
+    /// [`HeapFile::update_waiting`].
+    pub fn update_mvcc(
+        &self,
+        tid: Tid,
+        new_tuple: &[u8],
+        txn: &mut Transaction,
+    ) -> Result<TmResult> {
+        let xid = txn.write_xid()?;
+        let cid = txn.command_id();
+        let tm = txn.tm();
+        self.update_checked(tid, new_tuple, xid, cid, &|page| {
+            satisfies_update(page, tid, xid, cid, tm)
+        })
+    }
+
     /// The new version goes on the same page when it fits. Otherwise the old
     /// page and a target page are locked together in block order and both
-    /// changes are logged in one record.
-    pub fn update(&self, tid: Tid, new_tuple: &[u8], xid: Xid, cid: CommandId) -> Result<Tid> {
+    /// changes are logged in one record. `check` decides, under the old
+    /// page's lock, whether the update may proceed.
+    fn update_checked(
+        &self,
+        tid: Tid,
+        new_tuple: &[u8],
+        xid: Xid,
+        cid: CommandId,
+        check: &dyn Fn(&[u8]) -> Result<Option<TmResult>>,
+    ) -> Result<TmResult> {
         check_size(new_tuple)?;
         let old_pin = self.pool.fetch(self.tag(tid.blk))?;
         {
             let mut page = old_pin.write();
-            check_updatable(&page, tid)?;
+            if let Some(r) = check(&page)? {
+                return Ok(r);
+            }
             if let Some(p) = place(&mut page, tid.blk, new_tuple)? {
                 stamp_xmax(&mut page, tid, xid, cid, Some(p.tid))?;
                 let mut b = BlockRef::new(self.rel, tid.blk);
                 b.data = xmax_data(tid.slot, xid, cid);
                 b.data.extend_from_slice(&p.tid.slot.0.to_le_bytes());
                 b.data.extend_from_slice(&p.stored);
-                self.log1(Record::new(RmgrId::Heap, info::UPDATE_SAME), b, &mut page);
-                return Ok(p.tid);
+                let mut rec = Record::new(RmgrId::Heap, info::UPDATE_SAME);
+                rec.xid = xid;
+                self.log1(rec, b, &mut page);
+                return Ok(TmResult::Ok(p.tid));
             }
         }
 
@@ -171,24 +254,26 @@ impl HeapFile {
             let tblk = BlockNumber(target);
             let tpin = self.pool.fetch(self.tag(tblk))?;
             let (mut old, mut new) = lock_pair(&old_pin, tid.blk, &tpin, tblk);
-            if let Some(new_tid) =
-                self.update_across(&mut old, &mut new, tid, tblk, new_tuple, xid, cid)?
-            {
-                return Ok(new_tid);
+            match self.update_across(&mut old, &mut new, tid, tblk, new_tuple, xid, cid, check)? {
+                Across::Done(r) => return Ok(r),
+                Across::Full => {}
             }
         }
         let (nblk, npin) = self.pool.extend(self.rel)?;
         // A fresh block is always above the old one: lock old first.
         let mut old = old_pin.write();
         let mut new = npin.write();
-        let new_tid = self
-            .update_across(&mut old, &mut new, tid, nblk, new_tuple, xid, cid)?
-            .ok_or(too_large(new_tuple))?;
+        let r =
+            match self.update_across(&mut old, &mut new, tid, nblk, new_tuple, xid, cid, check)? {
+                Across::Done(r) => r,
+                Across::Full => return Err(too_large(new_tuple)),
+            };
         self.advance_target(nblk);
-        Ok(new_tid)
+        Ok(r)
     }
 
-    /// Update with both pages locked. `None` if the new page is full.
+    /// Update with both pages locked (re-checking the old version, which
+    /// may have changed while it was unlocked).
     #[allow(clippy::too_many_arguments)]
     fn update_across(
         &self,
@@ -199,10 +284,13 @@ impl HeapFile {
         new_tuple: &[u8],
         xid: Xid,
         cid: CommandId,
-    ) -> Result<Option<Tid>> {
-        check_updatable(old, tid)?;
+        check: &dyn Fn(&[u8]) -> Result<Option<TmResult>>,
+    ) -> Result<Across> {
+        if let Some(r) = check(old)? {
+            return Ok(Across::Done(r));
+        }
         let Some(p) = place(new, nblk, new_tuple)? else {
-            return Ok(None);
+            return Ok(Across::Full);
         };
         stamp_xmax(old, tid, xid, cid, Some(p.tid))?;
         let mut ob = BlockRef::new(self.rel, tid.blk);
@@ -211,9 +299,149 @@ impl HeapFile {
         ob.data.extend_from_slice(&p.tid.slot.0.to_le_bytes());
         let nb = insert_block(self.rel, &p);
         let mut rec = Record::new(RmgrId::Heap, info::UPDATE);
+        rec.xid = xid;
         rec.blocks = vec![ob, nb];
         self.log(rec, &mut [&mut old[..], &mut new[..]]);
-        Ok(Some(p.tid))
+        Ok(Across::Done(TmResult::Ok(p.tid)))
+    }
+
+    /// [`HeapFile::delete_mvcc`] with the waiting and isolation rules: waits
+    /// for a transaction modifying the row and retries. A row changed by a
+    /// transaction that committed after `txn`'s snapshot is a serialization
+    /// failure under Snapshot Isolation; under Read Committed the result is
+    /// returned so the caller can re-check the newest version.
+    pub fn delete_waiting(&self, tid: Tid, txn: &mut Transaction) -> Result<TmResult> {
+        loop {
+            let r = self.delete_mvcc(tid, txn)?;
+            if let Some(r) = resolve(r, txn)? {
+                return Ok(r);
+            }
+        }
+    }
+
+    /// [`HeapFile::update_mvcc`] with the waiting and isolation rules of
+    /// [`HeapFile::delete_waiting`].
+    pub fn update_waiting(
+        &self,
+        tid: Tid,
+        new_tuple: &[u8],
+        txn: &mut Transaction,
+    ) -> Result<TmResult> {
+        loop {
+            let r = self.update_mvcc(tid, new_tuple, txn)?;
+            if let Some(r) = resolve(r, txn)? {
+                return Ok(r);
+            }
+        }
+    }
+
+    /// Copies the tuple at `tid` if it is visible to `snap`.
+    pub fn fetch_visible(
+        &self,
+        tid: Tid,
+        snap: &Snapshot,
+        me: &Me,
+        tm: &dyn TransactionManager,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(t) = self.fetch(tid)? else {
+            return Ok(None);
+        };
+        let v = satisfies_mvcc(&TupleHeader::decode(&t)?, snap, me, tm)?;
+        Ok(v.visible.then_some(t))
+    }
+
+    /// Follows the update chain from `tid` to the newest version that is
+    /// not deleted by a committed transaction (Read Committed re-check;
+    /// PostgreSQL's EvalPlanQual fetch). `None` if the row was deleted.
+    pub fn latest_version(&self, mut tid: Tid, tm: &dyn TransactionManager) -> Result<Option<Tid>> {
+        loop {
+            let Some(t) = self.fetch(tid)? else {
+                return Ok(None);
+            };
+            let h = TupleHeader::decode(&t)?;
+            if !h.xmax.is_valid() || tm.status(h.xmax)? != XidStatus::Committed {
+                return Ok(Some(tid));
+            }
+            if h.ctid == tid {
+                return Ok(None); // deleted
+            }
+            // The next version must be the one this updater inserted.
+            match self.fetch(h.ctid)? {
+                Some(n) if TupleHeader::decode(&n)?.xmin == h.xmax => tid = h.ctid,
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    /// Sequential scan returning only versions visible to `snap`, setting
+    /// hint bits opportunistically page by page.
+    pub fn scan_mvcc<'a>(
+        &'a self,
+        snap: Snapshot,
+        me: Me,
+        tm: &'a dyn TransactionManager,
+    ) -> Result<HeapMvccScan<'a>> {
+        Ok(HeapMvccScan {
+            heap: self,
+            snap,
+            me,
+            tm,
+            nblocks: self.pool.nblocks(self.rel)?,
+            next_blk: 0,
+            buffered: Vec::new().into_iter(),
+        })
+    }
+
+    /// Visible tuples of one page. Suggested hint bits are applied if the
+    /// exclusive lock is free, to tuples whose xmin/xmax are unchanged.
+    fn read_page_mvcc(
+        &self,
+        blk: BlockNumber,
+        snap: &Snapshot,
+        me: &Me,
+        tm: &dyn TransactionManager,
+    ) -> Result<Vec<(Tid, Vec<u8>)>> {
+        let pin = self.pool.fetch(self.tag(blk))?;
+        let mut out = Vec::new();
+        let mut hints: Vec<(SlotId, Xid, Xid, u16)> = Vec::new();
+        {
+            let page = pin.read();
+            if is_new_page(&page) {
+                return Ok(out);
+            }
+            let p = SlottedPage::open(&page[..])?;
+            for s in 0..p.slot_count() {
+                let slot = SlotId(s);
+                let Some(t) = p.get_item(slot) else { continue };
+                let h = TupleHeader::decode(t)?;
+                let v = satisfies_mvcc(&h, snap, me, tm)?;
+                if v.hints != 0 && h.infomask & v.hints != v.hints {
+                    hints.push((slot, h.xmin, h.xmax, v.hints));
+                }
+                if v.visible {
+                    out.push((Tid { blk, slot }, t.to_vec()));
+                }
+            }
+        }
+        if !hints.is_empty()
+            && let Some(mut page) = pin.try_write()
+        {
+            let mut changed = false;
+            let mut p = SlottedPage::open(&mut page[..])?;
+            for (slot, xmin, xmax, bits) in hints {
+                if let Some(item) = p.get_item_mut(slot) {
+                    let h = TupleHeader::decode(item)?;
+                    if h.xmin == xmin && h.xmax == xmax {
+                        tuple::set_hint_bits(item, bits)?;
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                page.mark_dirty_hint();
+            }
+        }
+        Ok(out)
     }
 
     /// Sets hint bits on the tuple at `tid` if the page's exclusive lock is
@@ -254,7 +482,12 @@ impl HeapFile {
 
     fn log_insert(&self, page: &mut PageMut<'_>, p: &Placed) {
         let b = insert_block(self.rel, p);
-        self.log1(Record::new(RmgrId::Heap, info::INSERT), b, page);
+        let mut rec = Record::new(RmgrId::Heap, info::INSERT);
+        // The inserter's xid, so recovery never hands it out again.
+        rec.xid = TupleHeader::decode(&p.stored)
+            .map(|h| h.xmin)
+            .unwrap_or(Xid::INVALID);
+        self.log1(rec, b, page);
     }
 
     fn log1(&self, mut rec: Record, block: BlockRef, page: &mut PageMut<'_>) {
@@ -293,6 +526,104 @@ impl HeapFile {
                 p.get_item(slot).map(|t| (Tid { blk, slot }, t.to_vec()))
             })
             .collect())
+    }
+}
+
+/// Result of trying to delete or update a tuple (PostgreSQL's TM_Result).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmResult {
+    /// Done. For an update, the new version's TID; for a delete, `tid`.
+    Ok(Tid),
+    /// Not visible to the current command (inserted by it, by an aborted or
+    /// still running transaction, or deleted by an earlier command of ours).
+    Invisible,
+    /// Already deleted or updated by the current command.
+    SelfModified,
+    /// Another running transaction is deleting or updating it.
+    BeingModified(Xid),
+    /// Updated by committed transaction `xmax`; the newer version is `ctid`.
+    Updated { ctid: Tid, xmax: Xid },
+    /// Deleted by committed transaction `xmax`.
+    Deleted { xmax: Xid },
+}
+
+/// Outcome of an update with both pages locked.
+enum Across {
+    Done(TmResult),
+    /// The target page has no room.
+    Full,
+}
+
+/// Whether `txn` (xid, cid) may delete or update the version at `tid`
+/// (PostgreSQL's HeapTupleSatisfiesUpdate). `None` means it may.
+fn satisfies_update(
+    page: &[u8],
+    tid: Tid,
+    xid: Xid,
+    cid: CommandId,
+    tm: &dyn TransactionManager,
+) -> Result<Option<TmResult>> {
+    if is_new_page(page) {
+        return Err(HeapError::TupleNotFound { tid });
+    }
+    let p = SlottedPage::open(page)?;
+    let item = p
+        .get_item(tid.slot)
+        .ok_or(HeapError::TupleNotFound { tid })?;
+    let h = TupleHeader::decode(item)?;
+    let mask = h.infomask;
+
+    if h.xmin == xid {
+        if h.cmin >= cid {
+            return Ok(Some(TmResult::Invisible));
+        }
+    } else if mask & infomask::XMIN_INVALID != 0
+        || (mask & infomask::XMIN_COMMITTED == 0 && tm.status(h.xmin)? != XidStatus::Committed)
+    {
+        return Ok(Some(TmResult::Invisible));
+    }
+
+    if !h.xmax.is_valid() || mask & infomask::XMAX_INVALID != 0 {
+        return Ok(None);
+    }
+    if h.xmax == xid {
+        return Ok(Some(if h.cmax >= cid {
+            TmResult::SelfModified
+        } else {
+            TmResult::Invisible
+        }));
+    }
+    let status = if mask & infomask::XMAX_COMMITTED != 0 {
+        XidStatus::Committed
+    } else {
+        tm.status(h.xmax)?
+    };
+    Ok(match status {
+        XidStatus::InProgress => Some(TmResult::BeingModified(h.xmax)),
+        XidStatus::Aborted => None, // the old xmax is overwritten
+        XidStatus::Committed if h.ctid != tid => Some(TmResult::Updated {
+            ctid: h.ctid,
+            xmax: h.xmax,
+        }),
+        XidStatus::Committed => Some(TmResult::Deleted { xmax: h.xmax }),
+    })
+}
+
+/// Applies the waiting and isolation rules to a DML result: `None` means
+/// "waited for the other transaction, retry".
+fn resolve(r: TmResult, txn: &mut Transaction) -> Result<Option<TmResult>> {
+    match r {
+        TmResult::BeingModified(x) => {
+            txn.wait_for(x)?;
+            Ok(None)
+        }
+        TmResult::Updated { xmax, .. } | TmResult::Deleted { xmax }
+            if txn.isolation() == Isolation::SnapshotIsolation
+                && txn.snapshot().is_running(xmax) =>
+        {
+            Err(TransactionError::SerializationFailure.into())
+        }
+        other => Ok(Some(other)),
     }
 }
 
@@ -424,6 +755,41 @@ impl Iterator for HeapScan<'_> {
     }
 }
 
+/// Iterator over the tuples visible to a snapshot, page at a time.
+pub struct HeapMvccScan<'a> {
+    heap: &'a HeapFile,
+    snap: Snapshot,
+    me: Me,
+    tm: &'a dyn TransactionManager,
+    nblocks: u32,
+    next_blk: u32,
+    buffered: std::vec::IntoIter<(Tid, Vec<u8>)>,
+}
+
+impl Iterator for HeapMvccScan<'_> {
+    type Item = Result<(Tid, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(t) = self.buffered.next() {
+                return Some(Ok(t));
+            }
+            if self.next_blk >= self.nblocks {
+                return None;
+            }
+            let blk = BlockNumber(self.next_blk);
+            self.next_blk += 1;
+            match self.heap.read_page_mvcc(blk, &self.snap, &self.me, self.tm) {
+                Ok(tuples) => self.buffered = tuples.into_iter(),
+                Err(e) => {
+                    self.next_blk = self.nblocks;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}
+
 fn check_size(tuple: &[u8]) -> Result<()> {
     if tuple.len() > MAX_TUPLE_SIZE {
         return Err(too_large(tuple));
@@ -516,7 +882,6 @@ fn stamp_xmax(
     cmax: CommandId,
     new_tid: Option<Tid>,
 ) -> Result<()> {
-    check_updatable(page, tid)?;
     let mut p = SlottedPage::open(&mut page[..])?;
     let item = p
         .get_item_mut(tid.slot)
@@ -987,6 +1352,297 @@ mod tests {
         assert!(wal.flushed_lsn() >= lsn);
         let on_disk = mem.raw(FileKey::Relation(REL), 0, PAGE_SIZE);
         assert_eq!(page_lsn(&on_disk), lsn);
+    }
+
+    // ---- MVCC ----
+
+    mod mvcc {
+        use super::super::*;
+        use crate::access::tuple::{TupleDesc, deform_tuple, form_tuple, infomask};
+        use crate::buffer::SingleModeFlush;
+        use crate::lock::{LockManager, WaitPolicy};
+        use crate::storage::backend::{FenceToken, FixedFence};
+        use crate::storage::mem::MemBackend;
+        use crate::types::{DataType, Value};
+        use crate::wal::{Engine, WalConfig, initdb};
+        use std::collections::BTreeSet;
+        use std::time::Duration;
+
+        const FENCE: FenceToken = FenceToken::new(1);
+        const REL: RelFileId = RelFileId(16384);
+
+        fn cfg() -> WalConfig {
+            WalConfig {
+                timeline: 1,
+                segment_size: 256 * 1024,
+            }
+        }
+
+        struct Env {
+            mem: Arc<MemBackend>,
+            engine: Engine,
+            locks: Arc<LockManager>,
+            heap: HeapFile,
+        }
+
+        fn start(mem: &Arc<MemBackend>) -> Env {
+            let engine = Engine::start(
+                mem.clone(),
+                Arc::new(SingleModeFlush::new(FENCE)),
+                cfg(),
+                64,
+            )
+            .unwrap();
+            let heap = HeapFile::open(REL, engine.pool().clone()).unwrap();
+            Env {
+                mem: mem.clone(),
+                engine,
+                locks: Arc::new(LockManager::new()),
+                heap,
+            }
+        }
+
+        fn env() -> Env {
+            let mem = Arc::new(MemBackend::default());
+            initdb(mem.clone(), Arc::new(FixedFence(FENCE)), cfg()).unwrap();
+            let engine = Engine::start(
+                mem.clone(),
+                Arc::new(SingleModeFlush::new(FENCE)),
+                cfg(),
+                64,
+            )
+            .unwrap();
+            engine.create_relation(REL).unwrap();
+            drop(engine);
+            start(&mem)
+        }
+
+        impl Env {
+            fn begin(&self, iso: Isolation) -> Transaction {
+                let tm: Arc<dyn TransactionManager> = self.engine.txn().clone();
+                Transaction::begin(
+                    tm,
+                    self.locks.clone(),
+                    iso,
+                    WaitPolicy {
+                        lock_timeout: Some(Duration::from_secs(5)),
+                        deadlock_timeout: Duration::from_millis(100),
+                    },
+                )
+            }
+
+            fn insert(&self, txn: &mut Transaction, id: i64) -> Tid {
+                let xid = txn.write_xid().unwrap();
+                self.heap.insert(&row(id, xid, txn.command_id())).unwrap()
+            }
+
+            /// Ids visible to `txn`'s current statement snapshot.
+            fn ids(&self, txn: &mut Transaction) -> BTreeSet<i64> {
+                let snap = txn.snapshot();
+                let me = Me {
+                    xid: txn.xid(),
+                    cid: txn.command_id(),
+                };
+                self.heap
+                    .scan_mvcc(snap, me, txn.tm())
+                    .unwrap()
+                    .map(|r| id_of(&r.unwrap().1))
+                    .collect()
+            }
+
+            fn infomask(&self, tid: Tid) -> u16 {
+                TupleHeader::decode(&self.heap.fetch(tid).unwrap().unwrap())
+                    .unwrap()
+                    .infomask
+            }
+        }
+
+        fn desc() -> TupleDesc {
+            TupleDesc::new(vec![DataType::Int8]).unwrap()
+        }
+
+        fn row(id: i64, xid: Xid, cid: CommandId) -> Vec<u8> {
+            form_tuple(&desc(), &[Value::Int8(id)], xid, cid).unwrap()
+        }
+
+        fn id_of(t: &[u8]) -> i64 {
+            match deform_tuple(&desc(), t).unwrap()[0] {
+                Value::Int8(i) => i,
+                _ => panic!("bad row"),
+            }
+        }
+
+        fn set(ids: &[i64]) -> BTreeSet<i64> {
+            ids.iter().copied().collect()
+        }
+
+        /// A committed row.
+        fn committed_row(e: &Env, id: i64) -> Tid {
+            let mut t = e.begin(Isolation::ReadCommitted);
+            let tid = e.insert(&mut t, id);
+            t.commit().unwrap();
+            tid
+        }
+
+        #[test]
+        fn insert_visibility_by_snapshot_and_command() {
+            let e = env();
+            let mut t1 = e.begin(Isolation::ReadCommitted);
+            let mut rc = e.begin(Isolation::ReadCommitted);
+            let mut si = e.begin(Isolation::SnapshotIsolation);
+            assert!(e.ids(&mut si).is_empty()); // SI snapshot taken now
+            e.insert(&mut t1, 1);
+            assert!(e.ids(&mut t1).is_empty(), "current command's insert");
+            t1.next_command();
+            assert_eq!(e.ids(&mut t1), set(&[1]));
+            rc.statement_snapshot();
+            assert!(e.ids(&mut rc).is_empty(), "uncommitted");
+            t1.commit().unwrap();
+            assert!(e.ids(&mut rc).is_empty(), "same statement, same snapshot");
+            rc.statement_snapshot();
+            assert_eq!(e.ids(&mut rc), set(&[1]), "new statement sees the commit");
+            si.statement_snapshot();
+            assert!(e.ids(&mut si).is_empty(), "SI keeps its first snapshot");
+        }
+
+        #[test]
+        fn aborted_rows_stay_invisible_and_get_hints() {
+            let e = env();
+            let mut t1 = e.begin(Isolation::ReadCommitted);
+            let a = e.insert(&mut t1, 1);
+            t1.abort().unwrap();
+            let c = committed_row(&e, 2);
+            let mut r = e.begin(Isolation::ReadCommitted);
+            assert_eq!(e.ids(&mut r), set(&[2]));
+            assert_ne!(e.infomask(a) & infomask::XMIN_INVALID, 0);
+            assert_ne!(e.infomask(c) & infomask::XMIN_COMMITTED, 0);
+        }
+
+        #[test]
+        fn concurrent_delete_waits_for_the_other_transaction() {
+            for commit_first in [true, false] {
+                let e = env();
+                let tid = committed_row(&e, 1);
+                let mut t1 = e.begin(Isolation::ReadCommitted);
+                assert_eq!(e.heap.delete_mvcc(tid, &mut t1).unwrap(), TmResult::Ok(tid));
+                let x1 = t1.xid().unwrap();
+                let mut t2 = e.begin(Isolation::ReadCommitted);
+                assert_eq!(
+                    e.heap.delete_mvcc(tid, &mut t2).unwrap(),
+                    TmResult::BeingModified(x1)
+                );
+                let r = std::thread::scope(|s| {
+                    let h = s.spawn(|| e.heap.delete_waiting(tid, &mut t2).unwrap());
+                    std::thread::sleep(Duration::from_millis(50));
+                    if commit_first {
+                        t1.commit().unwrap();
+                    } else {
+                        t1.abort().unwrap();
+                    }
+                    h.join().unwrap()
+                });
+                if commit_first {
+                    assert_eq!(r, TmResult::Deleted { xmax: x1 });
+                } else {
+                    assert_eq!(r, TmResult::Ok(tid), "aborted xmax is overwritten");
+                }
+            }
+        }
+
+        #[test]
+        fn snapshot_isolation_first_updater_wins() {
+            let e = env();
+            let tid = committed_row(&e, 1);
+            let mut si = e.begin(Isolation::SnapshotIsolation);
+            assert_eq!(e.ids(&mut si), set(&[1]));
+            let mut t1 = e.begin(Isolation::ReadCommitted);
+            let x1 = t1.write_xid().unwrap();
+            e.heap
+                .update_mvcc(tid, &row(10, x1, t1.command_id()), &mut t1)
+                .unwrap();
+            t1.commit().unwrap();
+            let xs = si.write_xid().unwrap();
+            let err = e
+                .heap
+                .update_waiting(tid, &row(20, xs, si.command_id()), &mut si)
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                HeapError::Transaction(TransactionError::SerializationFailure)
+            ));
+        }
+
+        #[test]
+        fn read_committed_follows_update_chain() {
+            let e = env();
+            let tid = committed_row(&e, 1);
+            let mut t1 = e.begin(Isolation::ReadCommitted);
+            let x1 = t1.write_xid().unwrap();
+            let TmResult::Ok(v2) = e
+                .heap
+                .update_mvcc(tid, &row(2, x1, t1.command_id()), &mut t1)
+                .unwrap()
+            else {
+                panic!("update failed");
+            };
+            t1.commit().unwrap();
+
+            let mut t2 = e.begin(Isolation::ReadCommitted);
+            let x2 = t2.write_xid().unwrap();
+            let r = e
+                .heap
+                .update_waiting(tid, &row(3, x2, t2.command_id()), &mut t2)
+                .unwrap();
+            assert_eq!(r, TmResult::Updated { ctid: v2, xmax: x1 });
+            let latest = e.heap.latest_version(tid, t2.tm()).unwrap();
+            assert_eq!(latest, Some(v2));
+            let r = e
+                .heap
+                .update_waiting(v2, &row(3, x2, t2.command_id()), &mut t2)
+                .unwrap();
+            assert!(matches!(r, TmResult::Ok(_)));
+            t2.commit().unwrap();
+            let mut r = e.begin(Isolation::ReadCommitted);
+            assert_eq!(e.ids(&mut r), set(&[3]));
+        }
+
+        #[test]
+        fn own_modifications_by_command() {
+            let e = env();
+            let tid = committed_row(&e, 1);
+            let mut t = e.begin(Isolation::ReadCommitted);
+            assert_eq!(e.heap.delete_mvcc(tid, &mut t).unwrap(), TmResult::Ok(tid));
+            assert_eq!(
+                e.heap.delete_mvcc(tid, &mut t).unwrap(),
+                TmResult::SelfModified
+            );
+            t.next_command();
+            assert_eq!(
+                e.heap.delete_mvcc(tid, &mut t).unwrap(),
+                TmResult::Invisible
+            );
+            assert!(e.ids(&mut t).is_empty());
+        }
+
+        #[test]
+        fn uncommitted_rows_are_invisible_after_crash() {
+            let e = env();
+            committed_row(&e, 1);
+            let mut open = e.begin(Isolation::ReadCommitted);
+            e.insert(&mut open, 2);
+            let open_xid = open.xid().unwrap();
+            let mem = e.mem.clone();
+            committed_row(&e, 3); // flushes WAL past the uncommitted insert
+            std::mem::forget(open); // crash: no abort record
+            drop(e);
+            let e = start(&mem);
+            let mut r = e.begin(Isolation::ReadCommitted);
+            assert_eq!(e.ids(&mut r), set(&[1, 3]));
+            assert!(
+                e.engine.txn().next_xid() > open_xid,
+                "xid that wrote a row is not reused"
+            );
+        }
     }
 
     #[test]

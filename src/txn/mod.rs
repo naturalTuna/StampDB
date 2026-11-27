@@ -12,10 +12,12 @@ pub mod clog;
 mod manager;
 mod procarray;
 mod snapshot;
+mod transaction;
 
 pub use manager::LocalTxnManager;
 pub use procarray::ProcArray;
 pub use snapshot::Snapshot;
+pub use transaction::{Isolation, Transaction, TransactionError};
 
 use std::fmt;
 

@@ -48,8 +48,8 @@ docs/         SETUP.md(환경), PROGRESS.md(이 문서), notes.md(구현 중 미
 3. [완료] 가시성 판단 `access::visibility::satisfies_mvcc` (스냅샷 우선, hint 제안)
 4. [완료] lock manager `lock`: PG 8모드, FIFO, transaction lock, wait_for_xid, lock_timeout
 5. [완료] deadlock 검출: deadlock_timeout 경과 시 wait-for 그래프 사이클 검사, 요청 쪽 에러 (LockError::Deadlock 자리 있음)
-6. [다음] MVCC heap DML: 레코드에 쓰는 쪽 xid 기록(rec.xid, 복구 시 next_xid 계산에 필요), xmin/xmax, TM_Result류 충돌 결과, xid 대기, RC 최신 버전 추적 헬퍼, SI 직렬화 오류, 가시 튜플만 내보내는 스캔과 hint 일괄 설정
-7. 격리 수준 시나리오 테스트 + 크래시 후 미커밋 행 비가시 확인, 이후 PROGRESS 갱신
+6. [완료] MVCC heap DML: 레코드에 쓰는 쪽 xid 기록(rec.xid, 복구 시 next_xid 계산에 필요), xmin/xmax, TM_Result류 충돌 결과, xid 대기, RC 최신 버전 추적 헬퍼, SI 직렬화 오류, 가시 튜플만 내보내는 스캔과 hint 일괄 설정
+7. [다음] 격리 수준 시나리오 테스트 + 크래시 후 미커밋 행 비가시 확인, 이후 PROGRESS 갱신
 
 ## 이전 단계에서 넘어온 한계와 미결 사항
 
