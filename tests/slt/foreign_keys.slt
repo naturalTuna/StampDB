@@ -125,3 +125,95 @@ DROP TABLE ref2
 statement ok
 DROP TABLE pair
 
+statement ok
+CREATE TABLE author (id INT PRIMARY KEY, name TEXT)
+
+statement ok
+CREATE TABLE book (id INT PRIMARY KEY, author_id INT REFERENCES author ON DELETE CASCADE ON UPDATE CASCADE, title TEXT)
+
+statement ok
+CREATE TABLE review (id INT, book_id INT REFERENCES book ON DELETE CASCADE, editor INT DEFAULT 0 REFERENCES author ON DELETE SET DEFAULT ON UPDATE CASCADE, reviewer INT REFERENCES author ON DELETE SET NULL ON UPDATE SET NULL)
+
+statement ok
+INSERT INTO author VALUES (0, 'nobody'), (1, 'ann'), (2, 'bob'), (3, 'cid')
+
+statement ok
+INSERT INTO book VALUES (10, 1, 'a1'), (11, 1, 'a2'), (12, 2, 'b1'), (13, 3, 'c1')
+
+statement ok
+INSERT INTO review VALUES (100, 10, 2, 3), (101, 11, 3, 2), (102, 12, 1, 1), (103, 13, 2, 2)
+
+statement ok
+DELETE FROM author WHERE id = 1
+
+query IIT
+SELECT * FROM book ORDER BY id
+----
+12 2 b1
+13 3 c1
+
+query IIII
+SELECT * FROM review ORDER BY id
+----
+102 12 0 NULL
+103 13 2 2
+
+statement ok
+UPDATE author SET id = 20 WHERE id = 2
+
+query IIT
+SELECT * FROM book ORDER BY id
+----
+12 20 b1
+13 3 c1
+
+query IIII
+SELECT * FROM review ORDER BY id
+----
+102 12 0 NULL
+103 13 20 NULL
+
+statement ok
+UPDATE author SET id = 30 WHERE id = 3
+
+statement ok
+DELETE FROM author WHERE id = 30
+
+query IIII
+SELECT * FROM review ORDER BY id
+----
+102 12 0 NULL
+
+statement error update or delete on table "author" violates foreign key constraint "review_editor_fkey" on table "review"
+DELETE FROM author WHERE id = 0
+
+statement ok
+CREATE TABLE node (id INT PRIMARY KEY, parent INT REFERENCES node ON DELETE CASCADE, label TEXT NOT NULL)
+
+statement ok
+INSERT INTO node VALUES (1, NULL, 'root'), (2, 1, 'a'), (3, 1, 'b'), (4, 2, 'a1'), (5, 4, 'a1x'), (6, NULL, 'other')
+
+statement ok
+DELETE FROM node WHERE id = 2
+
+query IIT
+SELECT * FROM node ORDER BY id
+----
+1 NULL root
+3 1 b
+6 NULL other
+
+statement ok
+CREATE TABLE strict (id INT, aid INT NOT NULL REFERENCES author ON DELETE SET NULL)
+
+statement ok
+INSERT INTO strict VALUES (1, 20)
+
+statement error null value in column "aid" of relation "strict" violates not-null constraint
+DELETE FROM author WHERE id = 20
+
+query I
+SELECT count(*) FROM author
+----
+2
+

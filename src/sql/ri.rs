@@ -422,13 +422,30 @@ fn child_key_bounds(fk: &FkIn, key_vals: &[Value]) -> Result<Option<KeyRange>> {
     Ok(Some((index.rel, Bound::Included(prefix), upper)))
 }
 
+/// Whether child `row` references the key `parent_row` holds for `fk`.
+pub fn references(fk: &FkIn, row: &[Value], parent_row: &[Value]) -> bool {
+    let pv: Vec<Value> = fk.cols.iter().map(|&c| parent_row[c].clone()).collect();
+    let cv: Vec<Value> = fk.child_cols.iter().map(|&c| row[c].clone()).collect();
+    match (convert(&pv, &fk.key_types), convert(&cv, &fk.key_types)) {
+        (Some(a), Some(b)) => a
+            .iter()
+            .zip(&b)
+            .all(|(x, y)| compare(x, y) == Some(Ordering::Equal)),
+        _ => false,
+    }
+}
+
 /// The NO ACTION / RESTRICT error for a parent change.
 pub fn still_referenced(parent: &RelationInfo, fk: &FkIn) -> SqlError {
+    still_referenced_name(&parent.name, fk)
+}
+
+pub fn still_referenced_name(parent: &str, fk: &FkIn) -> SqlError {
     SqlError::new(
         code::FOREIGN_KEY_VIOLATION,
         format!(
             "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
-            parent.name, fk.name, fk.child.name
+            parent, fk.name, fk.child.name
         ),
     )
 }

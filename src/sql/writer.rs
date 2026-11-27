@@ -6,12 +6,13 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use super::binder::{Binder, Rules};
+use super::binder::{Binder, Rules, parse_expr};
 use super::error::{Result, SqlError, code};
+use super::expr::{CastMode, cast};
 use super::ri::{self, FkIn};
 use crate::access::btree::BTree;
 use crate::access::heap::{HeapFile, TmResult};
-use crate::access::tuple::{Tid, form_tuple};
+use crate::access::tuple::{Tid, deform_tuple, form_tuple};
 use crate::buffer::BufferPool;
 use crate::catalog::{Catalog, FkAction, IndexInfo, RelationInfo};
 use crate::txn::Transaction;
@@ -162,11 +163,106 @@ impl<'a> Writer<'a> {
             Some(_) => fk.on_update,
             None => fk.on_delete,
         };
-        match action {
-            FkAction::NoAction | FkAction::Restrict => Err(ri::still_referenced(&parent.table, fk)),
-            _ => Err(SqlError::unsupported(
-                "referential actions other than NO ACTION and RESTRICT",
-            )),
+        if matches!(action, FkAction::NoAction | FkAction::Restrict) {
+            return Err(ri::still_referenced(&parent.table, fk));
+        }
+        // The new key values for the child columns (SET DEFAULT computes
+        // the child's defaults; CASCADE on update copies the new key).
+        let set: Option<Vec<Value>> = match (action, new) {
+            (FkAction::Cascade, None) => None,
+            (FkAction::Cascade, Some(new)) => Some(
+                fk.cols
+                    .iter()
+                    .zip(&fk.child_cols)
+                    .map(|(&pc, &cc)| {
+                        cast(
+                            new[pc].clone(),
+                            fk.child.columns[cc].ty,
+                            CastMode::Assignment,
+                        )
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+            (FkAction::SetNull, _) => Some(vec![Value::Null; fk.child_cols.len()]),
+            _ => Some(
+                fk.child_cols
+                    .iter()
+                    .map(|&cc| self.default_value(txn, &fk.child, cc))
+                    .collect::<Result<_>>()?,
+            ),
+        };
+        let ctw = self.table(txn, &fk.child, None)?;
+        // Like PostgreSQL's RI triggers, each action is a new command, so
+        // it sees (and may change again) versions written by earlier ones.
+        txn.next_command();
+        for (tid, row) in children {
+            self.act_on_child(txn, &ctw, fk, old, tid, row, set.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// Deletes a referencing child row (`set` is `None`) or sets its key
+    /// columns to `set`. A child updated concurrently in the meantime is
+    /// followed to its newest version, which is acted on if it still
+    /// references the old key (as EvalPlanQual does for DML).
+    #[allow(clippy::too_many_arguments)]
+    fn act_on_child(
+        &mut self,
+        txn: &mut Transaction,
+        ctw: &TableWriter,
+        fk: &FkIn,
+        parent_old: &[Value],
+        mut tid: Tid,
+        mut row: Vec<Value>,
+        set: Option<&[Value]>,
+    ) -> Result<()> {
+        loop {
+            let r = match set {
+                None => self.delete(txn, ctw, tid, &row)?,
+                Some(vals) => {
+                    let mut new_row = row.clone();
+                    for (&cc, v) in fk.child_cols.iter().zip(vals) {
+                        new_row[cc] = v.clone();
+                    }
+                    // SET DEFAULT back to the removed key still references it.
+                    if ri::references(fk, &new_row, parent_old) {
+                        let parent = self.cat.lookup_oid(txn, fk.index.table)?;
+                        let name = parent.map_or_else(String::new, |p| p.name);
+                        return Err(ri::still_referenced_name(&name, fk));
+                    }
+                    self.update(txn, ctw, tid, &row, &new_row)?
+                }
+            };
+            match r {
+                TmResult::Updated { ctid, .. } => {
+                    let Some(latest) = ctw.heap.latest_version(ctid, txn.tm())? else {
+                        return Ok(());
+                    };
+                    let Some(t) = ctw.heap.fetch(latest)? else {
+                        return Ok(());
+                    };
+                    let r = deform_tuple(&ctw.table.desc(), &t)?;
+                    if !ri::references(fk, &r, parent_old) {
+                        return Ok(());
+                    }
+                    (tid, row) = (latest, r);
+                }
+                TmResult::BeingModified(_) => {
+                    return Err(SqlError::internal("row still being modified after waiting"));
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    /// Column `col`'s DEFAULT value (NULL without one).
+    fn default_value(&self, txn: &mut Transaction, t: &RelationInfo, col: usize) -> Result<Value> {
+        let c = &t.columns[col];
+        match &c.default {
+            Some(text) => Binder::new(self.cat, txn)
+                .bind_default(c, &parse_expr(text)?)?
+                .eval(&[]),
+            None => Ok(Value::Null),
         }
     }
 }

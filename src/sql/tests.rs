@@ -974,3 +974,38 @@ fn foreign_keys_under_snapshot_isolation() {
     );
     ok(&mut b, "ROLLBACK");
 }
+
+#[test]
+fn cascades_wait_for_and_follow_concurrent_child_updates() {
+    let db = db();
+    let mut a = db.session();
+    let mut b = db.session();
+    ok(&mut a, "CREATE TABLE p (id INT PRIMARY KEY)");
+    ok(
+        &mut a,
+        "CREATE TABLE c (id INT, pid INT REFERENCES p ON DELETE CASCADE, v TEXT)",
+    );
+    ok(&mut a, "INSERT INTO p VALUES (1), (2)");
+    ok(
+        &mut a,
+        "INSERT INTO c VALUES (10, 1, 'x'), (11, 1, 'y'), (20, 2, 'z')",
+    );
+    // A child is being updated (not its key): the cascade waits, then
+    // deletes the new version.
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "UPDATE c SET v = 'changed' WHERE id = 10");
+    let (_, r) = blocked(&mut b, "DELETE FROM p WHERE id = 1", || {
+        ok(&mut a, "COMMIT")
+    });
+    assert_eq!(r.unwrap()[0].tag, "DELETE 1");
+    assert_eq!(q(&mut a, "SELECT id FROM c ORDER BY id"), rows(&[&["20"]]));
+    // A child moved to another parent meanwhile is left alone.
+    ok(&mut a, "INSERT INTO p VALUES (3)");
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "UPDATE c SET pid = 3 WHERE id = 20");
+    let (_, r) = blocked(&mut b, "DELETE FROM p WHERE id = 2", || {
+        ok(&mut a, "COMMIT")
+    });
+    assert_eq!(r.unwrap()[0].tag, "DELETE 1");
+    assert_eq!(q(&mut a, "SELECT id, pid FROM c"), rows(&[&["20", "3"]]));
+}
