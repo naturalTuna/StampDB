@@ -206,6 +206,11 @@ pub fn page_lsn(page: &[u8]) -> Lsn {
     Lsn(read_u64(page, off::LSN))
 }
 
+/// Sets the page LSN in the header bytes. `page` must be at least 8 bytes.
+pub fn set_page_lsn(page: &mut [u8], lsn: Lsn) {
+    page[off::LSN..off::LSN + 8].copy_from_slice(&lsn.0.to_le_bytes());
+}
+
 /// True if `page` is entirely zero (allocated but never initialized).
 pub fn is_new_page(page: &[u8]) -> bool {
     page.iter().all(|&b| b == 0)

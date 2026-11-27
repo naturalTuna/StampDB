@@ -6,6 +6,7 @@ use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 
 use super::pool::{BufferPool, BufferTag, Frame, FrameId};
 use crate::storage::AlignedBuf;
+use crate::storage::page::set_page_lsn;
 
 /// A pinned page. The frame cannot be evicted while this guard lives.
 /// Dropping it unpins the frame.
@@ -45,6 +46,8 @@ impl<'a> PinGuard<'a> {
         PageMut {
             guard: frame.content.write(),
             frame,
+            pool: self.pool,
+            tag: self.tag,
         }
     }
 
@@ -54,10 +57,12 @@ impl<'a> PinGuard<'a> {
     /// rather than waited for.
     pub fn try_write(&self) -> Option<PageMut<'_>> {
         let frame = self.pool.frame(self.fid);
-        frame
-            .content
-            .try_write()
-            .map(|guard| PageMut { guard, frame })
+        frame.content.try_write().map(|guard| PageMut {
+            guard,
+            frame,
+            pool: self.pool,
+            tag: self.tag,
+        })
     }
 }
 
@@ -86,6 +91,8 @@ impl Deref for PageRef<'_> {
 pub struct PageMut<'a> {
     guard: RwLockWriteGuard<'a, AlignedBuf>,
     frame: &'a Frame,
+    pool: &'a BufferPool,
+    tag: BufferTag,
 }
 
 impl PageMut<'_> {
@@ -96,13 +103,27 @@ impl PageMut<'_> {
         self.frame.hdr.lock().dirty = true;
     }
 
+    /// Identity of the locked page.
+    pub fn tag(&self) -> BufferTag {
+        self.tag
+    }
+
     /// Marks the page dirty because only hint bits changed
     /// (PostgreSQL's `MarkBufferDirtyHint`).
     ///
-    /// Kept separate from [`PageMut::mark_dirty`] because the WAL step hooks
-    /// here: the first hint change after a checkpoint must log a full page
-    /// image, so a torn write of a hint-only change stays recoverable.
-    pub fn mark_dirty_hint(&self) {
+    /// The first hint change after a checkpoint's redo point logs a full
+    /// page image and advances the page LSN (DESIGN: hint bit policy): a
+    /// torn write of the page can then be repaired from WAL, and in ha mode
+    /// the flush constraint sees the change. Aborts the process if the WAL
+    /// insert fails, since the page is already modified.
+    pub fn mark_dirty_hint(&mut self) {
+        if let Some(wal) = self.pool.wal() {
+            match wal.log_hint_fpi(self.tag.rel, self.tag.blk, &self.guard) {
+                Ok(Some(lsn)) => set_page_lsn(&mut self.guard, lsn),
+                Ok(None) => {}
+                Err(e) => crate::wal::fatal("hint bit image could not be logged", &e),
+            }
+        }
         self.frame.hdr.lock().dirty = true;
     }
 }

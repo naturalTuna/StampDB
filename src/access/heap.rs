@@ -10,6 +10,15 @@
 //! This step has no visibility checks or row locks: concurrent delete or
 //! update of the same tuple is prevented by the transaction layer later.
 //! Here, deleting or updating a tuple whose xmax is already set is an error.
+//!
+//! # WAL
+//!
+//! When the pool has a WAL, every change is logged while the page lock is
+//! held, and the page LSN is set to the record's end (a failure there aborts
+//! the process: the page is already modified). Each block reference carries
+//! everything needed to redo that page alone ([`redo`]), so pages can be
+//! replayed independently. An update that moves to another page locks both
+//! pages in block order and logs one record, so it is atomic after a crash.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -18,12 +27,27 @@ use super::tuple::{self, MAX_TUPLE_SIZE, Tid, TupleError, TupleHeader};
 use crate::buffer::{BufferError, BufferPool, BufferTag, PageMut};
 use crate::storage::StorageError;
 use crate::storage::backend::RelFileId;
-use crate::storage::page::{BlockNumber, PageKind, is_new_page};
+use crate::storage::page::{BlockNumber, PageKind, is_new_page, set_page_lsn};
 use crate::storage::slotted::{SlotId, SlottedPage};
 use crate::txn::{CommandId, Xid};
+use crate::wal::fatal;
+use crate::wal::record::{BlockRef, Record, RmgrId};
 
 /// Marker for "no target block yet".
 const NO_TARGET: u32 = u32::MAX;
+
+/// `info` values of heap WAL records.
+pub mod info {
+    /// Block 0: `slot u16 | tuple`.
+    pub const INSERT: u8 = 0;
+    /// Block 0: `slot u16 | xmax u64 | cmax u32`.
+    pub const DELETE: u8 = 1;
+    /// Block 0 (old): `slot u16 | xmax u64 | cmax u32 | new blk u32 | new
+    /// slot u16`; block 1 (new): `slot u16 | tuple`.
+    pub const UPDATE: u8 = 2;
+    /// Block 0: `old slot u16 | xmax u64 | cmax u32 | new slot u16 | tuple`.
+    pub const UPDATE_SAME: u8 = 3;
+}
 
 /// Errors from heap operations.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +66,9 @@ pub enum HeapError {
 
     #[error("tuple ({}, {}) already deleted or updated by xid {}", tid.blk.0, tid.slot.0, xmax.0)]
     AlreadyDeleted { tid: Tid, xmax: Xid },
+
+    #[error("heap redo failed: {0}")]
+    Redo(&'static str),
 }
 
 /// Result alias for this module.
@@ -78,20 +105,19 @@ impl HeapFile {
         if target != NO_TARGET {
             let pin = self.pool.fetch(self.tag(BlockNumber(target)))?;
             let mut page = pin.write();
-            if let Some(tid) = place(&mut page, BlockNumber(target), tuple)? {
-                return Ok(tid);
+            if let Some(p) = place(&mut page, BlockNumber(target), tuple)? {
+                self.log_insert(&mut page, &p);
+                return Ok(p.tid);
             }
         }
         // Target full (or none): append a block. Concurrent inserters may
         // each extend; that only costs a little space.
         let (blk, pin) = self.pool.extend(self.rel)?;
         let mut page = pin.write();
-        let tid = place(&mut page, blk, tuple)?.ok_or(TupleError::TooLarge {
-            len: tuple.len(),
-            max: MAX_TUPLE_SIZE,
-        })?;
+        let p = place(&mut page, blk, tuple)?.ok_or(too_large(tuple))?;
+        self.log_insert(&mut page, &p);
         self.advance_target(blk);
-        Ok(tid)
+        Ok(p.tid)
     }
 
     /// Copies the tuple at `tid`, or `None` if the slot holds no tuple.
@@ -110,33 +136,84 @@ impl HeapFile {
         let pin = self.pool.fetch(self.tag(tid.blk))?;
         let mut page = pin.write();
         stamp_xmax(&mut page, tid, xmax, cmax, None)?;
-        page.mark_dirty();
+        let mut b = BlockRef::new(self.rel, tid.blk);
+        b.data = xmax_data(tid.slot, xmax, cmax);
+        self.log1(Record::new(RmgrId::Heap, info::DELETE), b, &mut page);
         Ok(())
     }
 
     /// Inserts `new_tuple` as the next version of `tid`, marking the old one
     /// deleted by `xid` with its ctid pointing at the new version.
     ///
-    /// The new version goes on the same page when it fits (one page lock
-    /// covers both changes); otherwise it is inserted elsewhere first and the
-    /// old version is stamped afterwards.
+    /// The new version goes on the same page when it fits. Otherwise the old
+    /// page and a target page are locked together in block order and both
+    /// changes are logged in one record.
     pub fn update(&self, tid: Tid, new_tuple: &[u8], xid: Xid, cid: CommandId) -> Result<Tid> {
         check_size(new_tuple)?;
+        let old_pin = self.pool.fetch(self.tag(tid.blk))?;
         {
-            let pin = self.pool.fetch(self.tag(tid.blk))?;
-            let mut page = pin.write();
+            let mut page = old_pin.write();
             check_updatable(&page, tid)?;
-            if let Some(new_tid) = place(&mut page, tid.blk, new_tuple)? {
-                stamp_xmax(&mut page, tid, xid, cid, Some(new_tid))?;
+            if let Some(p) = place(&mut page, tid.blk, new_tuple)? {
+                stamp_xmax(&mut page, tid, xid, cid, Some(p.tid))?;
+                let mut b = BlockRef::new(self.rel, tid.blk);
+                b.data = xmax_data(tid.slot, xid, cid);
+                b.data.extend_from_slice(&p.tid.slot.0.to_le_bytes());
+                b.data.extend_from_slice(&p.stored);
+                self.log1(Record::new(RmgrId::Heap, info::UPDATE_SAME), b, &mut page);
+                return Ok(p.tid);
+            }
+        }
+
+        // Try the cached target block first, then a fresh block.
+        let target = self.target.load(Ordering::Relaxed);
+        if target != NO_TARGET && target != tid.blk.0 {
+            let tblk = BlockNumber(target);
+            let tpin = self.pool.fetch(self.tag(tblk))?;
+            let (mut old, mut new) = lock_pair(&old_pin, tid.blk, &tpin, tblk);
+            if let Some(new_tid) =
+                self.update_across(&mut old, &mut new, tid, tblk, new_tuple, xid, cid)?
+            {
                 return Ok(new_tid);
             }
         }
-        let new_tid = self.insert(new_tuple)?;
-        let pin = self.pool.fetch(self.tag(tid.blk))?;
-        let mut page = pin.write();
-        stamp_xmax(&mut page, tid, xid, cid, Some(new_tid))?;
-        page.mark_dirty();
+        let (nblk, npin) = self.pool.extend(self.rel)?;
+        // A fresh block is always above the old one: lock old first.
+        let mut old = old_pin.write();
+        let mut new = npin.write();
+        let new_tid = self
+            .update_across(&mut old, &mut new, tid, nblk, new_tuple, xid, cid)?
+            .ok_or(too_large(new_tuple))?;
+        self.advance_target(nblk);
         Ok(new_tid)
+    }
+
+    /// Update with both pages locked. `None` if the new page is full.
+    #[allow(clippy::too_many_arguments)]
+    fn update_across(
+        &self,
+        old: &mut PageMut<'_>,
+        new: &mut PageMut<'_>,
+        tid: Tid,
+        nblk: BlockNumber,
+        new_tuple: &[u8],
+        xid: Xid,
+        cid: CommandId,
+    ) -> Result<Option<Tid>> {
+        check_updatable(old, tid)?;
+        let Some(p) = place(new, nblk, new_tuple)? else {
+            return Ok(None);
+        };
+        stamp_xmax(old, tid, xid, cid, Some(p.tid))?;
+        let mut ob = BlockRef::new(self.rel, tid.blk);
+        ob.data = xmax_data(tid.slot, xid, cid);
+        ob.data.extend_from_slice(&nblk.0.to_le_bytes());
+        ob.data.extend_from_slice(&p.tid.slot.0.to_le_bytes());
+        let nb = insert_block(self.rel, &p);
+        let mut rec = Record::new(RmgrId::Heap, info::UPDATE);
+        rec.blocks = vec![ob, nb];
+        self.log(rec, &mut [&mut old[..], &mut new[..]]);
+        Ok(Some(p.tid))
     }
 
     /// Sets hint bits on the tuple at `tid` if the page's exclusive lock is
@@ -175,6 +252,33 @@ impl HeapFile {
         })
     }
 
+    fn log_insert(&self, page: &mut PageMut<'_>, p: &Placed) {
+        let b = insert_block(self.rel, p);
+        self.log1(Record::new(RmgrId::Heap, info::INSERT), b, page);
+    }
+
+    fn log1(&self, mut rec: Record, block: BlockRef, page: &mut PageMut<'_>) {
+        rec.blocks = vec![block];
+        self.log(rec, &mut [&mut page[..]]);
+    }
+
+    /// Logs `rec` (one block per page, in order) and stamps the pages' LSN.
+    /// No-op without a WAL. Aborts on failure: the pages are already
+    /// modified (critical section).
+    fn log(&self, rec: Record, pages: &mut [&mut [u8]]) {
+        let Some(wal) = self.pool.wal() else {
+            return;
+        };
+        let images: Vec<&[u8]> = pages.iter().map(|p| &**p).collect();
+        let end = match wal.insert_fpw(rec, &images) {
+            Ok((_, end)) => end,
+            Err(e) => fatal("heap WAL insert failed", &e),
+        };
+        for p in pages.iter_mut() {
+            set_page_lsn(p, end);
+        }
+    }
+
     /// Moves the target block forward to `blk` (never backward).
     fn advance_target(&self, blk: BlockNumber) {
         let _ = self
@@ -203,6 +307,101 @@ impl HeapFile {
             })
             .collect())
     }
+}
+
+/// Locks two different pages of one relation in block order.
+fn lock_pair<'a>(
+    a_pin: &'a crate::buffer::PinGuard<'_>,
+    a_blk: BlockNumber,
+    b_pin: &'a crate::buffer::PinGuard<'_>,
+    b_blk: BlockNumber,
+) -> (PageMut<'a>, PageMut<'a>) {
+    if a_blk < b_blk {
+        let a = a_pin.write();
+        (a, b_pin.write())
+    } else {
+        let b = b_pin.write();
+        (a_pin.write(), b)
+    }
+}
+
+/// Applies block `idx` of a heap record to `page`. The caller has checked
+/// that the page LSN is below the record's and sets the page LSN afterwards.
+pub fn redo(info: u8, idx: usize, block: &BlockRef, page: &mut [u8]) -> Result<()> {
+    if block.will_init {
+        SlottedPage::init(&mut *page, PageKind::Heap, 0)?;
+    }
+    let d = &block.data;
+    match (info, idx) {
+        (info::INSERT, 0) | (info::UPDATE, 1) => redo_add(
+            page,
+            u16_at(d, 0)?,
+            d.get(2..).ok_or(HeapError::Redo("short data"))?,
+        ),
+        (info::DELETE, 0) => redo_xmax(page, d, None),
+        (info::UPDATE, 0) => {
+            let new = Tid {
+                blk: BlockNumber(u32_at(d, 14)?),
+                slot: SlotId(u16_at(d, 18)?),
+            };
+            redo_xmax(page, d, Some(new))
+        }
+        (info::UPDATE_SAME, 0) => {
+            let new_slot = u16_at(d, 14)?;
+            redo_add(
+                page,
+                new_slot,
+                d.get(16..).ok_or(HeapError::Redo("short data"))?,
+            )?;
+            let new = Tid {
+                blk: block.blk,
+                slot: SlotId(new_slot),
+            };
+            redo_xmax(page, d, Some(new))
+        }
+        _ => Err(HeapError::Redo("unknown record")),
+    }
+}
+
+/// Re-adds a tuple; it must land in the slot it had originally.
+fn redo_add(page: &mut [u8], slot: u16, tuple: &[u8]) -> Result<()> {
+    let mut p = SlottedPage::open(page)?;
+    match p.add_item(tuple)? {
+        Some(s) if s.0 == slot => Ok(()),
+        _ => Err(HeapError::Redo("tuple did not land in its original slot")),
+    }
+}
+
+fn redo_xmax(page: &mut [u8], d: &[u8], new: Option<Tid>) -> Result<()> {
+    let slot = SlotId(u16_at(d, 0)?);
+    let xmax = Xid(u64_at(d, 2)?);
+    let cmax = CommandId(u32_at(d, 10)?);
+    let mut p = SlottedPage::open(page)?;
+    let item = p
+        .get_item_mut(slot)
+        .ok_or(HeapError::Redo("missing tuple"))?;
+    tuple::set_xmax(item, xmax, cmax)?;
+    if let Some(n) = new {
+        tuple::set_ctid(item, n)?;
+    }
+    Ok(())
+}
+
+fn u16_at(d: &[u8], at: usize) -> Result<u16> {
+    let b = d.get(at..at + 2).ok_or(HeapError::Redo("short data"))?;
+    Ok(u16::from_le_bytes([b[0], b[1]]))
+}
+
+fn u32_at(d: &[u8], at: usize) -> Result<u32> {
+    let b = d.get(at..at + 4).ok_or(HeapError::Redo("short data"))?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn u64_at(d: &[u8], at: usize) -> Result<u64> {
+    let b = d.get(at..at + 8).ok_or(HeapError::Redo("short data"))?;
+    let mut a = [0u8; 8];
+    a.copy_from_slice(b);
+    Ok(u64::from_le_bytes(a))
 }
 
 /// Iterator over all tuples of a heap, page at a time.
@@ -240,21 +439,51 @@ impl Iterator for HeapScan<'_> {
 
 fn check_size(tuple: &[u8]) -> Result<()> {
     if tuple.len() > MAX_TUPLE_SIZE {
-        return Err(TupleError::TooLarge {
-            len: tuple.len(),
-            max: MAX_TUPLE_SIZE,
-        }
-        .into());
+        return Err(too_large(tuple));
     }
     TupleHeader::decode(tuple)?;
     Ok(())
 }
 
+fn too_large(tuple: &[u8]) -> HeapError {
+    TupleError::TooLarge {
+        len: tuple.len(),
+        max: MAX_TUPLE_SIZE,
+    }
+    .into()
+}
+
+/// A tuple just added to a page.
+struct Placed {
+    tid: Tid,
+    /// The page was all-zero and initialized by this insert.
+    initialized: bool,
+    /// The tuple as stored (ctid set).
+    stored: Vec<u8>,
+}
+
+fn insert_block(rel: RelFileId, p: &Placed) -> BlockRef {
+    let mut b = BlockRef::new(rel, p.tid.blk);
+    b.will_init = p.initialized;
+    b.data = p.tid.slot.0.to_le_bytes().to_vec();
+    b.data.extend_from_slice(&p.stored);
+    b
+}
+
+fn xmax_data(slot: SlotId, xmax: Xid, cmax: CommandId) -> Vec<u8> {
+    let mut d = Vec::with_capacity(14);
+    d.extend_from_slice(&slot.0.to_le_bytes());
+    d.extend_from_slice(&xmax.0.to_le_bytes());
+    d.extend_from_slice(&cmax.0.to_le_bytes());
+    d
+}
+
 /// Adds `tuple` to the locked page `blk` (initializing an all-zero page),
 /// sets its ctid to itself and marks the page dirty. `None` if it does not
 /// fit.
-fn place(page: &mut PageMut<'_>, blk: BlockNumber, tuple: &[u8]) -> Result<Option<Tid>> {
-    if is_new_page(page) {
+fn place(page: &mut PageMut<'_>, blk: BlockNumber, tuple: &[u8]) -> Result<Option<Placed>> {
+    let initialized = is_new_page(page);
+    if initialized {
         SlottedPage::init(&mut page[..], PageKind::Heap, 0)?;
         page.mark_dirty();
     }
@@ -263,11 +492,17 @@ fn place(page: &mut PageMut<'_>, blk: BlockNumber, tuple: &[u8]) -> Result<Optio
         return Ok(None);
     };
     let tid = Tid { blk, slot };
-    if let Some(item) = p.get_item_mut(slot) {
-        tuple::set_ctid(item, tid)?;
-    }
+    let item = p
+        .get_item_mut(slot)
+        .ok_or(HeapError::Redo("added tuple missing"))?;
+    tuple::set_ctid(item, tid)?;
+    let stored = item.to_vec();
     page.mark_dirty();
-    Ok(Some(tid))
+    Ok(Some(Placed {
+        tid,
+        initialized,
+        stored,
+    }))
 }
 
 /// Fails unless `tid` holds a tuple with no xmax.
@@ -566,6 +801,205 @@ mod tests {
             heap.set_hint_bits(missing, infomask::XMIN_COMMITTED),
             Err(HeapError::TupleNotFound { .. })
         ));
+    }
+
+    // ---- WAL ----
+
+    use crate::access::tuple::infomask;
+    use crate::storage::backend::{FileKey, FixedFence};
+    use crate::storage::page::{Lsn, PAGE_SIZE, page_lsn};
+    use crate::wal::log::{FIRST_LSN, xlog_info};
+    use crate::wal::{Wal, WalConfig, WalReader};
+    use std::collections::HashMap;
+
+    fn wal_cfg() -> WalConfig {
+        WalConfig {
+            timeline: 1,
+            segment_size: 64 * 1024,
+        }
+    }
+
+    fn setup_wal(frames: usize) -> (Arc<MemBackend>, Arc<BufferPool>, HeapFile) {
+        let mem = Arc::new(MemBackend::default());
+        let disk = Arc::new(DiskManager::new(mem.clone()));
+        disk.create_relation(REL, FENCE).unwrap();
+        let wal =
+            Arc::new(Wal::create(mem.clone(), Arc::new(FixedFence(FENCE)), wal_cfg()).unwrap());
+        let pool = Arc::new(
+            BufferPool::new(frames, disk, Arc::new(SingleModeFlush::new(FENCE)))
+                .unwrap()
+                .with_wal(wal),
+        );
+        let heap = HeapFile::open(REL, pool.clone()).unwrap();
+        (mem, pool, heap)
+    }
+
+    fn records(mem: &Arc<MemBackend>) -> Vec<(Lsn, crate::wal::record::Record)> {
+        let mut rd = WalReader::new(mem.clone(), wal_cfg(), FIRST_LSN, Some(Lsn::INVALID)).unwrap();
+        let mut out = Vec::new();
+        while let Some((_, end, d)) = rd.next_record().unwrap() {
+            out.push((end, d.record));
+        }
+        out
+    }
+
+    /// Minimal redo loop over all WAL, starting from empty pages.
+    fn replay(mem: &Arc<MemBackend>) -> HashMap<u32, Vec<u8>> {
+        let mut pages: HashMap<u32, Vec<u8>> = HashMap::new();
+        for (end, rec) in records(mem) {
+            for (i, b) in rec.blocks.iter().enumerate() {
+                let page = pages.entry(b.blk.0).or_insert_with(|| vec![0u8; PAGE_SIZE]);
+                if let Some(img) = &b.image {
+                    page.copy_from_slice(img);
+                } else if page_lsn(page) < end {
+                    assert_eq!(rec.rmgr, RmgrId::Heap);
+                    redo(rec.info, i, b, page).unwrap();
+                } else {
+                    continue;
+                }
+                set_page_lsn(page, end);
+            }
+        }
+        pages
+    }
+
+    fn live_page(pool: &BufferPool, blk: u32) -> Vec<u8> {
+        let pin = pool
+            .fetch(BufferTag {
+                rel: REL,
+                blk: BlockNumber(blk),
+            })
+            .unwrap();
+        let mut p = pin.read().to_vec();
+        p[8..12].fill(0); // checksum is stamped on write copies only
+        p
+    }
+
+    #[test]
+    fn wal_replay_reproduces_pages() {
+        let (mem, pool, heap) = setup_wal(64);
+        let big = "u".repeat(900);
+        let mut tids = Vec::new();
+        for i in 0..60 {
+            tids.push(heap.insert(&row(i, &big)).unwrap());
+        }
+        for (n, &t) in tids.iter().enumerate().step_by(5) {
+            heap.delete(t, Xid(100 + n as u64), CommandId(1)).unwrap();
+        }
+        let live = |t: Tid| {
+            heap.fetch(t)
+                .unwrap()
+                .is_some_and(|b| !TupleHeader::decode(&b).unwrap().xmax.is_valid())
+        };
+        // Small new versions stay on the page; large ones move elsewhere.
+        for &t in tids.iter().skip(1).step_by(7) {
+            if live(t) {
+                heap.update(t, &row(7, "short"), Xid(200), CommandId(2))
+                    .unwrap();
+            }
+        }
+        for &t in tids.iter().skip(3).step_by(11) {
+            if live(t) {
+                heap.update(t, &row(8, &"w".repeat(3000)), Xid(300), CommandId(3))
+                    .unwrap();
+            }
+        }
+        pool.wal().unwrap().flush_all();
+
+        let replayed = replay(&mem);
+        let n = pool.nblocks(REL).unwrap();
+        assert!(n > 5);
+        for blk in 0..n {
+            let mut want = replayed
+                .get(&blk)
+                .cloned()
+                .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
+            want[8..12].fill(0);
+            assert_eq!(
+                live_page(&pool, blk),
+                want,
+                "block {blk} differs after replay"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_page_update_is_one_record() {
+        let (mem, pool, heap) = setup_wal(8);
+        let fill = "f".repeat(2500);
+        let t = heap.insert(&row(1, &fill)).unwrap();
+        heap.insert(&row(2, &fill)).unwrap();
+        heap.insert(&row(3, &fill)).unwrap(); // page 0 nearly full
+        let new = heap
+            .update(t, &row(1, &fill), Xid(9), CommandId(0))
+            .unwrap();
+        assert_ne!(new.blk, t.blk);
+        pool.wal().unwrap().flush_all();
+        let recs = records(&mem);
+        let (_, upd) = recs.iter().find(|(_, r)| r.info == info::UPDATE).unwrap();
+        assert_eq!(upd.blocks.len(), 2);
+        assert_eq!((upd.blocks[0].blk, upd.blocks[1].blk), (t.blk, new.blk));
+        assert!(upd.blocks[1].will_init, "fresh page is rebuilt by redo");
+    }
+
+    #[test]
+    fn full_page_image_on_first_change_after_checkpoint() {
+        let (mem, pool, heap) = setup_wal(8);
+        let a = heap.insert(&row(1, "a")).unwrap();
+        let b = heap.insert(&row(2, "b")).unwrap();
+        let wal = pool.wal().unwrap().clone();
+        wal.begin_checkpoint();
+        heap.delete(a, Xid(5), CommandId(0)).unwrap();
+        heap.delete(b, Xid(5), CommandId(0)).unwrap();
+        wal.flush_all();
+        let dels: Vec<_> = records(&mem)
+            .into_iter()
+            .filter(|(_, r)| r.rmgr == RmgrId::Heap && r.info == info::DELETE)
+            .collect();
+        assert_eq!(dels.len(), 2);
+        assert!(
+            dels[0].1.blocks[0].image.is_some(),
+            "first change after redo point"
+        );
+        assert!(
+            dels[1].1.blocks[0].image.is_none(),
+            "page already logged since"
+        );
+        // The first insert initialized the page: no image needed there.
+        let first = &records(&mem)[0].1;
+        assert!(first.blocks[0].will_init && first.blocks[0].image.is_none());
+    }
+
+    #[test]
+    fn hint_bits_log_one_image_per_checkpoint() {
+        let (mem, pool, heap) = setup_wal(8);
+        let t = heap.insert(&row(1, "h")).unwrap();
+        let wal = pool.wal().unwrap().clone();
+        wal.begin_checkpoint();
+        let before = page_lsn(&live_page(&pool, t.blk.0));
+        assert!(heap.set_hint_bits(t, infomask::XMIN_COMMITTED).unwrap());
+        let after = page_lsn(&live_page(&pool, t.blk.0));
+        assert!(after > before, "hint image advanced the page LSN");
+        assert!(heap.set_hint_bits(t, infomask::XMAX_INVALID).unwrap());
+        wal.flush_all();
+        let fpis = records(&mem)
+            .into_iter()
+            .filter(|(_, r)| r.rmgr == RmgrId::Xlog && r.info == xlog_info::FPI_FOR_HINT)
+            .count();
+        assert_eq!(fpis, 1);
+    }
+
+    #[test]
+    fn page_write_flushes_wal_first() {
+        let (mem, pool, heap) = setup_wal(8);
+        let t = heap.insert(&row(1, "x")).unwrap();
+        let wal = pool.wal().unwrap().clone();
+        let lsn = page_lsn(&live_page(&pool, t.blk.0));
+        assert!(wal.flushed_lsn() < lsn);
+        pool.flush_all().unwrap();
+        assert!(wal.flushed_lsn() >= lsn);
+        let on_disk = mem.raw(FileKey::Relation(REL), 0, PAGE_SIZE);
+        assert_eq!(page_lsn(&on_disk), lsn);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use crate::storage::AlignedBuf;
 use crate::storage::backend::RelFileId;
 use crate::storage::disk::DiskManager;
 use crate::storage::page::{BlockNumber, PAGE_SIZE, page_lsn};
+use crate::wal::Wal;
 
 /// Number of mapping table partitions (PostgreSQL uses 128).
 pub const NUM_PARTITIONS: usize = 16;
@@ -109,6 +110,9 @@ pub struct BufferPool {
     clock_hand: AtomicUsize,
     disk: Arc<DiskManager>,
     control: Arc<dyn FlushControl>,
+    /// WAL to flush before writing a page (WAL-before-data); `None` for
+    /// unlogged use (tests of the pool itself).
+    wal: Option<Arc<Wal>>,
 }
 
 impl BufferPool {
@@ -139,7 +143,20 @@ impl BufferPool {
             clock_hand: AtomicUsize::new(0),
             disk,
             control,
+            wal: None,
         })
+    }
+
+    /// Attaches the WAL: pages are written only after the WAL is flushed up
+    /// to their LSN, and modifications are expected to be logged.
+    pub fn with_wal(mut self, wal: Arc<Wal>) -> Self {
+        self.wal = Some(wal);
+        self
+    }
+
+    /// The attached WAL, if any.
+    pub fn wal(&self) -> Option<&Arc<Wal>> {
+        self.wal.as_ref()
     }
 
     /// Number of frames.
@@ -482,11 +499,16 @@ impl BufferPool {
         if !self.control.may_flush(tag, page_lsn(&page)) {
             return Ok(FlushOutcome::Deferred);
         }
-        // WAL step: flush WAL up to the page LSN here before writing.
         let mut copy = AlignedBuf::new(PAGE_SIZE)?;
         frame.hdr.lock().dirty = false;
         copy.copy_from_slice(&page);
         drop(page);
+
+        // WAL before data: the changes in this page must be durable in the
+        // log before the page itself reaches disk.
+        if let Some(wal) = &self.wal {
+            wal.flush_to(page_lsn(&copy));
+        }
 
         let fence = self.control.fence_token();
         if let Err(e) = self.disk.write_page(tag.rel, tag.blk, &mut copy, fence) {

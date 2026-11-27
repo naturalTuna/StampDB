@@ -19,10 +19,10 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::record::{self, Decoded, HEADER_SIZE, Record};
+use super::record::{self, BlockRef, Decoded, HEADER_SIZE, Record, RmgrId};
 use super::{Result, WalError, fatal, is_not_found};
-use crate::storage::backend::{FenceSource, FileKey, StorageBackend};
-use crate::storage::page::Lsn;
+use crate::storage::backend::{FenceSource, FileKey, RelFileId, StorageBackend};
+use crate::storage::page::{BlockNumber, Lsn, PAGE_SIZE, is_new_page, page_lsn};
 use crate::storage::{AlignedBuf, IO_ALIGN};
 
 /// Default segment size (same as PostgreSQL).
@@ -30,6 +30,14 @@ pub const DEFAULT_SEGMENT_SIZE: u64 = 16 << 20;
 
 /// Position of the first record.
 pub const FIRST_LSN: Lsn = Lsn(32);
+
+/// `info` values of the Xlog resource manager.
+pub mod xlog_info {
+    /// A checkpoint; main data is the redo LSN (u64 LE).
+    pub const CHECKPOINT: u8 = 0;
+    /// A full page image taken because only hint bits changed.
+    pub const FPI_FOR_HINT: u8 = 1;
+}
 
 const BLOCK: u64 = IO_ALIGN as u64;
 const ZERO_CHUNK: usize = 1 << 20;
@@ -75,6 +83,11 @@ struct InsertState {
     next: Lsn,
     /// Start of the last inserted record.
     prev: Lsn,
+    /// Redo point of the latest checkpoint. A page whose LSN is not above
+    /// it gets a full page image on its next logged change (full page
+    /// writes). Changed only under the insert lock, so the decision made
+    /// in `insert_fpw` cannot race with a checkpoint starting.
+    redo: Lsn,
     /// LSN of `buf[0]`; always block-aligned.
     buf_start: u64,
     /// Bytes from `buf_start` to `next` not yet known durable (the first
@@ -115,6 +128,7 @@ impl Wal {
             InsertState {
                 next: FIRST_LSN,
                 prev: Lsn::INVALID,
+                redo: FIRST_LSN,
                 buf_start: 0,
                 buf: vec![0u8; FIRST_LSN.0 as usize],
             },
@@ -124,13 +138,15 @@ impl Wal {
 
     /// Continues an existing log after its last valid record: `end` is where
     /// the next record goes and `prev` is the start of the last record (both
-    /// as found by [`WalReader`]).
+    /// as found by [`WalReader`]); `redo` is the latest checkpoint's redo
+    /// point.
     pub fn open_at(
         backend: Arc<dyn StorageBackend>,
         fence: Arc<dyn FenceSource>,
         cfg: WalConfig,
         end: Lsn,
         prev: Lsn,
+        redo: Lsn,
     ) -> Result<Self> {
         cfg.validate()?;
         let buf_start = end.0 - end.0 % BLOCK;
@@ -149,6 +165,7 @@ impl Wal {
             InsertState {
                 next: end,
                 prev,
+                redo,
                 buf_start,
                 buf,
             },
@@ -183,6 +200,48 @@ impl Wal {
     /// modified page's LSN is set to. Not durable until [`Wal::flush_to`].
     pub fn insert(&self, rec: &Record) -> Result<(Lsn, Lsn)> {
         let mut g = self.insert.lock();
+        Self::append(&mut g, rec)
+    }
+
+    /// Appends a record, adding a full page image for each block whose page
+    /// has not been logged since the redo point (and is not rebuilt by redo
+    /// anyway). `pages[i]` is the current, already modified, content of
+    /// `rec.blocks[i]`.
+    pub fn insert_fpw(&self, mut rec: Record, pages: &[&[u8]]) -> Result<(Lsn, Lsn)> {
+        if pages.len() != rec.blocks.len() {
+            return Err(WalError::InvalidConfig("one page per block reference"));
+        }
+        let mut g = self.insert.lock();
+        for (b, page) in rec.blocks.iter_mut().zip(pages) {
+            if !b.will_init && needs_image(page, g.redo) {
+                b.image = Some(page.to_vec());
+            }
+        }
+        Self::append(&mut g, &rec)
+    }
+
+    /// Logs a full page image for a hint-bit-only change if the page has
+    /// not been logged since the redo point (DESIGN: hint bit policy).
+    /// Returns the record's end LSN, to become the page LSN, or `None` if
+    /// no image was needed.
+    pub fn log_hint_fpi(
+        &self,
+        rel: RelFileId,
+        blk: BlockNumber,
+        page: &[u8],
+    ) -> Result<Option<Lsn>> {
+        let mut g = self.insert.lock();
+        if !needs_image(page, g.redo) {
+            return Ok(None);
+        }
+        let mut rec = Record::new(RmgrId::Xlog, xlog_info::FPI_FOR_HINT);
+        let mut b = BlockRef::new(rel, blk);
+        b.image = Some(page.to_vec());
+        rec.blocks.push(b);
+        Self::append(&mut g, &rec).map(|(_, end)| Some(end))
+    }
+
+    fn append(g: &mut InsertState, rec: &Record) -> Result<(Lsn, Lsn)> {
         let bytes = rec.encode(g.prev)?;
         let start = g.next;
         let end = Lsn(start.0 + bytes.len() as u64);
@@ -190,6 +249,20 @@ impl Wal {
         g.prev = start;
         g.next = end;
         Ok((start, end))
+    }
+
+    /// Starts a checkpoint: the current insert position becomes the redo
+    /// point, so every page changed from now on is logged with a full image
+    /// first. Returns the redo point.
+    pub fn begin_checkpoint(&self) -> Lsn {
+        let mut g = self.insert.lock();
+        g.redo = g.next;
+        g.redo
+    }
+
+    /// Redo point of the latest (possibly in-progress) checkpoint.
+    pub fn redo_ptr(&self) -> Lsn {
+        self.insert.lock().redo
     }
 
     /// Where the next record will start.
@@ -298,6 +371,13 @@ impl Wal {
         f.created_upto = segno + 1;
         Ok(())
     }
+}
+
+/// Whether a page must be logged with a full image: it has a header and
+/// its LSN is not past the redo point. (An all-zero page has no content to
+/// protect from torn writes.)
+fn needs_image(page: &[u8], redo: Lsn) -> bool {
+    page.len() == PAGE_SIZE && !is_new_page(page) && page_lsn(page) <= redo
 }
 
 /// Sequential reader of WAL records.
@@ -507,7 +587,15 @@ mod tests {
         }
         let (got, rd) = read_all(&mem);
         assert_eq!(got.len(), 5);
-        let wal = Wal::open_at(mem.clone(), fence(), cfg(), rd.end_lsn(), rd.last_start()).unwrap();
+        let wal = Wal::open_at(
+            mem.clone(),
+            fence(),
+            cfg(),
+            rd.end_lsn(),
+            rd.last_start(),
+            FIRST_LSN,
+        )
+        .unwrap();
         for i in 5..8u8 {
             wal.insert(&rec(i, 50)).unwrap();
         }

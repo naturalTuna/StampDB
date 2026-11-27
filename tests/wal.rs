@@ -58,7 +58,7 @@ fn wal_survives_reopen_on_direct_io() {
     assert!(dir.path().join("wal/000000010000000000000000").is_file());
     assert!(dir.path().join("wal").read_dir().unwrap().count() >= 3);
 
-    let wal = Wal::open_at(be.clone(), fence(), cfg(), end, last).unwrap();
+    let wal = Wal::open_at(be.clone(), fence(), cfg(), end, last, FIRST_LSN).unwrap();
     for i in 300..320 {
         wal.insert(&rec(i)).unwrap();
     }
