@@ -4,3 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+thiserror = "2"
+
+# Abort on panic: a thread panicking while holding a latch may leave shared
+# state inconsistent, so the whole process restarts and recovers from WAL.
+# Note: Cargo ignores this for the test/bench profiles (test harness unwinds).
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
