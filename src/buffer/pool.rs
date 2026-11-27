@@ -323,23 +323,36 @@ impl BufferPool {
     /// it currently holds (`None` for a free frame). A dirty victim has been
     /// written back already.
     fn get_victim(&self) -> Result<(FrameId, Option<BufferTag>)> {
-        if let Some(fid) = self.free_list.lock().pop() {
-            self.frame(fid).hdr.lock().pin_count = 1;
+        if let Some(fid) = self.pop_free() {
             return Ok((fid, None));
         }
 
-        // Clock-sweep. Enough steps for every unpinned frame's usage count
-        // to decay from the maximum to zero, plus one more round.
+        // Clock-sweep with PostgreSQL's StrategyGetBuffer give-up rule:
+        // Exhausted after `n` consecutive frames that cannot be used
+        // (pinned, being read, on the free list, or flush deferred).
+        // Decrementing a usage count is progress and resets the counter.
+        //
+        // The hand is shared by all sweepers, so a pool only slightly larger
+        // than the number of concurrent pins can report Exhausted while an
+        // unpinned frame exists. The pool must be sized well above the
+        // maximum number of concurrent pins, as in PostgreSQL.
         let n = self.frames.len();
-        for _ in 0..n * (usize::from(MAX_USAGE_COUNT) + 2) {
+        let mut tries = n;
+        loop {
             let fid = FrameId(self.clock_hand.fetch_add(1, Ordering::Relaxed) % n);
             let mut h = self.frame(fid).hdr.lock();
             // Untagged unpinned frames are on the free list; leave them there.
             if h.pin_count > 0 || h.io_in_progress || h.tag.is_none() {
+                drop(h);
+                tries -= 1;
+                if tries == 0 {
+                    return Err(BufferError::Exhausted);
+                }
                 continue;
             }
             if h.usage_count > 0 {
                 h.usage_count -= 1;
+                tries = n;
                 continue;
             }
             h.pin_count = 1;
@@ -350,7 +363,14 @@ impl BufferPool {
                 match self.flush_frame(fid) {
                     Ok(FlushOutcome::Written | FlushOutcome::Clean) => {}
                     Ok(FlushOutcome::Deferred) => {
+                        // Single mode never defers. In ha mode, whether to
+                        // wait or drop lagging readers instead is open
+                        // (docs/notes.md).
                         self.unpin(fid);
+                        tries -= 1;
+                        if tries == 0 {
+                            return Err(BufferError::Exhausted);
+                        }
                         continue;
                     }
                     Err(e) => {
@@ -361,7 +381,13 @@ impl BufferPool {
             }
             return Ok((fid, tag));
         }
-        Err(BufferError::Exhausted)
+    }
+
+    /// Takes a frame from the free list, pinned.
+    fn pop_free(&self) -> Option<FrameId> {
+        let fid = self.free_list.lock().pop()?;
+        self.frame(fid).hdr.lock().pin_count = 1;
+        Some(fid)
     }
 
     /// Maps `new` onto the pinned frame `fid`, unmapping `old` if given.
@@ -626,6 +652,29 @@ mod tests {
             .get_item_mut(SlotId(0))
             .unwrap()[0] = byte;
         w.mark_dirty();
+    }
+
+    /// Every fetch in these tests holds at most one pin at a time.
+    const MAX_PINS_PER_THREAD: usize = 1;
+    /// Frames beyond the maximum number of concurrent pins.
+    const SLACK: usize = 4;
+
+    /// Pool size for `threads` concurrent workers. With at least this many
+    /// frames, Exhausted means a bug, not a pool that is too small.
+    fn pool_size(threads: usize) -> usize {
+        threads * MAX_PINS_PER_THREAD + SLACK
+    }
+
+    /// `fetch` that fails the test with a clear message on Exhausted.
+    fn fetch_or_fail(pool: &BufferPool, blk: u32) -> PinGuard<'_> {
+        match pool.fetch(tag(blk)) {
+            Ok(pin) => pin,
+            Err(BufferError::Exhausted) => panic!(
+                "Exhausted with {} frames, sized for the test's concurrency",
+                pool.capacity()
+            ),
+            Err(e) => panic!("fetch {blk}: {e}"),
+        }
     }
 
     fn on_disk(mem: &MemBackend, blk: u32) -> Vec<u8> {
@@ -955,17 +1004,15 @@ mod tests {
 
     #[test]
     fn concurrent_fetch_reads_once() {
-        // Each racing miss pins one frame before the install race is decided,
-        // so the pool needs at least as many frames as concurrent fetchers.
         let n = 8;
-        let (mem, pool) = setup(n, 1);
+        let (mem, pool) = setup(pool_size(n), 1);
         let reads = mem.reads();
         let barrier = Barrier::new(n);
         std::thread::scope(|s| {
             for _ in 0..n {
                 s.spawn(|| {
                     barrier.wait();
-                    let pin = pool.fetch(tag(0)).unwrap();
+                    let pin = fetch_or_fail(&pool, 0);
                     assert_eq!(item(&pin.read()), vec![0u8; 16]);
                 });
             }
@@ -976,39 +1023,46 @@ mod tests {
 
     #[test]
     fn concurrent_dirty_eviction_uses_pool_fence() {
-        let (mem, _disk, pool) = setup_with(4, 16, gate(true, 99));
+        const THREADS: u32 = 4;
+        const PAGES: u32 = 32; // well above the pool size: constant eviction
+        let (mem, _disk, pool) = setup_with(pool_size(THREADS as usize), PAGES, gate(true, 99));
         let before = mem.fences().len();
         std::thread::scope(|s| {
-            for t in 0..4u32 {
+            for t in 0..THREADS {
                 let pool = &pool;
                 s.spawn(move || {
                     for i in 0..300u32 {
-                        modify(pool, (i * 7 + t * 3) % 16, (i % 251) as u8);
+                        let pin = fetch_or_fail(pool, (i * 7 + t * 3) % PAGES);
+                        let mut w = pin.write();
+                        SlottedPage::open(&mut w[..])
+                            .unwrap()
+                            .get_item_mut(SlotId(0))
+                            .unwrap()[0] = (i % 251) as u8;
+                        w.mark_dirty();
                     }
                 });
             }
         });
         pool.flush_all().unwrap();
         let page_writes = &mem.fences()[before..];
-        assert!(page_writes.len() >= 16);
+        assert!(page_writes.len() >= PAGES as usize);
         assert!(page_writes.iter().all(|&f| f == FenceToken::new(99)));
-        for b in 0..16 {
+        for b in 0..PAGES {
             verify_checksum(&on_disk(&mem, b), BlockNumber(b)).unwrap();
         }
     }
 
     #[test]
     fn concurrent_fetch_with_eviction() {
-        let (_mem, pool) = setup(8, 32);
+        const THREADS: u32 = 4;
+        let (_mem, pool) = setup(pool_size(THREADS as usize), 32);
         std::thread::scope(|s| {
-            for t in 0..4u32 {
+            for t in 0..THREADS {
                 let pool = &pool;
                 s.spawn(move || {
                     for i in 0..500u32 {
                         let b = (i * 13 + t * 5) % 32;
-                        let pin = pool
-                            .fetch(tag(b))
-                            .unwrap_or_else(|e| panic!("fetch {b}: {e:?}"));
+                        let pin = fetch_or_fail(pool, b);
                         assert_eq!(item(&pin.read()), vec![b as u8; 16]);
                     }
                 });

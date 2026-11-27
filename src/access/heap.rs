@@ -490,21 +490,29 @@ mod tests {
 
     #[test]
     fn concurrent_inserts_are_all_visible_to_scan() {
-        let (pool, heap) = setup(8);
+        // Each insert holds at most one pin at a time; 4 frames of slack.
+        const THREADS: i64 = 4;
+        let (pool, heap) = setup(THREADS as usize + 4);
         let text = "c".repeat(200);
         std::thread::scope(|s| {
-            for t in 0..4i64 {
+            for t in 0..THREADS {
                 let (heap, text) = (&heap, &text);
                 s.spawn(move || {
                     for i in 0..500 {
-                        heap.insert(&row(t * 1000 + i, text)).unwrap();
+                        match heap.insert(&row(t * 1000 + i, text)) {
+                            Ok(_) => {}
+                            Err(HeapError::Buffer(BufferError::Exhausted)) => {
+                                panic!("Exhausted with a pool sized for {THREADS} threads")
+                            }
+                            Err(e) => panic!("insert: {e}"),
+                        }
                     }
                 });
             }
         });
         let ids: HashSet<i64> = heap.scan().unwrap().map(|r| id_of(&r.unwrap().1)).collect();
         assert_eq!(ids.len(), 2000);
-        assert!((0..4).all(|t| (0..500).all(|i| ids.contains(&(t * 1000 + i)))));
+        assert!((0..THREADS).all(|t| (0..500).all(|i| ids.contains(&(t * 1000 + i)))));
         pool.flush_all().unwrap();
     }
 

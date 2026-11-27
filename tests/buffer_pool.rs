@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use mydb::buffer::{BufferPool, BufferTag, SingleModeFlush};
+use mydb::buffer::{BufferError, BufferPool, BufferTag, SingleModeFlush};
 use mydb::storage::backend::{FenceToken, RelFileId};
 use mydb::storage::disk::DiskManager;
 use mydb::storage::local::LocalDirBackend;
@@ -16,8 +16,12 @@ use mydb::storage::slotted::{SlotId, SlottedPage};
 const FENCE: FenceToken = FenceToken::new(1);
 const REL: RelFileId = RelFileId(16384);
 const PAGES: u32 = 64;
-const FRAMES: usize = 8;
 const THREADS: usize = 4;
+/// Each fetch holds at most one pin at a time.
+const MAX_PINS_PER_THREAD: usize = 1;
+/// Pool sized above the maximum number of concurrent pins, so Exhausted
+/// here is a bug. PAGES is 8x larger to force constant eviction.
+const FRAMES: usize = THREADS * MAX_PINS_PER_THREAD + 4;
 const OPS_PER_THREAD: usize = 2000;
 
 fn open_pool(dir: &std::path::Path) -> (Arc<DiskManager>, BufferPool) {
@@ -71,9 +75,13 @@ fn concurrent_increments_survive_eviction_and_reload() {
                         let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (t as u64 + 1);
                         for _ in 0..OPS_PER_THREAD {
                             let blk = (next(&mut rng) % u64::from(PAGES)) as u32;
-                            let pin = pool
-                                .fetch(tag(blk))
-                                .unwrap_or_else(|e| panic!("fetch {blk}: {e}"));
+                            let pin = match pool.fetch(tag(blk)) {
+                                Ok(pin) => pin,
+                                Err(BufferError::Exhausted) => {
+                                    panic!("Exhausted with {FRAMES} frames for {THREADS} threads")
+                                }
+                                Err(e) => panic!("fetch {blk}: {e}"),
+                            };
                             let mut w = pin.write();
                             let mut p = SlottedPage::open(&mut w[..]).unwrap();
                             let item = p.get_item_mut(SlotId(0)).unwrap();
