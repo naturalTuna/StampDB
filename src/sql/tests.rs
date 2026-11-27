@@ -225,7 +225,7 @@ fn create_insert_select() {
         "column \"id\" is of type integer but expression is of type boolean"
     );
     assert_eq!(
-        fails(&mut s, "INSERT INTO t VALUES (1)").code,
+        fails(&mut s, "INSERT INTO t (id, name) VALUES (1)").code,
         code::SYNTAX_ERROR
     );
     ok(&mut s, "INSERT INTO t (id, v) VALUES (2.6, 'ab ')");
@@ -447,7 +447,7 @@ fn ddl_statements() {
         code::FEATURE_NOT_SUPPORTED
     );
     assert_eq!(
-        fails(&mut s, "CREATE TABLE d (a INT NOT NULL)").code,
+        fails(&mut s, "CREATE TABLE d (a INT REFERENCES t (a))").code,
         code::FEATURE_NOT_SUPPORTED
     );
     ok(&mut s, "INSERT INTO t VALUES (1, 'x'), (2, 'x')");
@@ -847,4 +847,44 @@ fn joins_use_hash_joins_and_pushed_down_filters() {
     // Three tables.
     let sql = "SELECT p.x, q.x FROM a p JOIN b ON p.id = b.aid JOIN a q ON q.id = b.aid + 1 ORDER BY 1, 2";
     assert_eq!(q(&mut s, sql), rows(&[&["one", "two"], &["one", "two"]]));
+}
+
+#[test]
+fn constraints_apply_to_rows_recomputed_after_concurrent_updates() {
+    let db = db();
+    let mut a = db.session();
+    let mut b = db.session();
+    ok(
+        &mut a,
+        "CREATE TABLE acct (id INT PRIMARY KEY, bal INT NOT NULL CHECK (bal >= 0))",
+    );
+    ok(&mut a, "INSERT INTO acct VALUES (1, 100)");
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "UPDATE acct SET bal = bal - 60 WHERE id = 1");
+    // b computes 100 - 50 first, then 40 - 50 on the new version: fails.
+    let (_, r) = blocked(
+        &mut b,
+        "UPDATE acct SET bal = bal - 50 WHERE id = 1",
+        || ok(&mut a, "COMMIT"),
+    );
+    let e = r.unwrap_err();
+    assert_eq!(e.code, code::CHECK_VIOLATION);
+    assert_eq!(
+        e.message,
+        "new row for relation \"acct\" violates check constraint \"acct_bal_check\""
+    );
+    assert_eq!(q(&mut a, "SELECT bal FROM acct"), rows(&[&["40"]]));
+    // The primary key's index is used and enforced.
+    assert_eq!(
+        plan_nodes(&mut a, "SELECT * FROM acct WHERE id = 1"),
+        ["Project", "IndexScan acct_pkey"]
+    );
+    assert_eq!(
+        fails(&mut a, "INSERT INTO acct VALUES (1, 0)").code,
+        code::UNIQUE_VIOLATION
+    );
+    assert_eq!(
+        fails(&mut a, "INSERT INTO acct VALUES (NULL, 0)").code,
+        code::NOT_NULL_VIOLATION
+    );
 }

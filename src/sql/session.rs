@@ -10,7 +10,7 @@ use sqlparser::ast;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use super::binder::{Binder, Bound, Kind, Utility, classify};
+use super::binder::{Binder, Bound, ConstraintDef, Kind, Rules, Utility, classify, parse_expr};
 use super::error::{Result, SqlError, code};
 use super::exec::{self, ExecEnv};
 use super::expr::{Expr, is_true};
@@ -19,7 +19,7 @@ use super::planner;
 use crate::access::heap::{HeapFile, TmResult};
 use crate::access::tuple::{deform_tuple, form_tuple};
 use crate::access::visibility::Me;
-use crate::catalog::{Catalog, RelKind, RelationInfo};
+use crate::catalog::{Catalog, Column, ConstraintKind, NewConstraint, RelKind, RelationInfo};
 use crate::lock::{LockManager, WaitPolicy};
 use crate::txn::{Isolation, Transaction, TransactionManager};
 use crate::types::Value;
@@ -274,6 +274,7 @@ impl Session {
             Utility::CreateTable {
                 name,
                 columns,
+                constraints,
                 if_not_exists,
             } => {
                 if *if_not_exists && cat.lookup_relation(txn, name)?.is_some() {
@@ -281,7 +282,8 @@ impl Session {
                         "NOTICE: relation \"{name}\" already exists, skipping"
                     )));
                 }
-                cat.create_table(txn, name, columns)?;
+                let constraints = self.name_constraints(txn, name, columns, constraints)?;
+                cat.create_table_with(txn, name, columns, &constraints)?;
                 Ok(QueryResult::tag("CREATE TABLE"))
             }
             Utility::DropTable { names, if_exists } => {
@@ -386,6 +388,102 @@ impl Session {
         }
     }
 
+    /// Validates DEFAULT and CHECK expressions and names the constraints
+    /// the way PostgreSQL does: t_pkey, t_a_b_key, t_a_check (one
+    /// referenced column) or t_check, with numbers appended on collisions.
+    fn name_constraints(
+        &self,
+        txn: &mut Transaction,
+        table: &str,
+        columns: &[Column],
+        defs: &[ConstraintDef],
+    ) -> Result<Vec<NewConstraint>> {
+        let cat = &self.db.catalog;
+        for c in columns {
+            if let Some(text) = &c.default {
+                Binder::new(cat, txn).bind_default(c, &parse_expr(text)?)?;
+            }
+        }
+        // Explicit names are reserved first.
+        let mut taken: Vec<String> = defs
+            .iter()
+            .filter_map(|d| match d {
+                ConstraintDef::PrimaryKey { name, .. }
+                | ConstraintDef::Unique { name, .. }
+                | ConstraintDef::Check { name, .. } => name.clone(),
+            })
+            .collect();
+        for (i, n) in taken.iter().enumerate() {
+            if taken[..i].contains(n) {
+                return Err(SqlError::new(
+                    code::DUPLICATE_OBJECT,
+                    format!("check constraint \"{n}\" already exists"),
+                ));
+            }
+        }
+        let mut out = Vec::new();
+        for d in defs {
+            let (name, kind) = match d {
+                ConstraintDef::PrimaryKey { name, columns } => {
+                    (name.clone(), ConstraintKind::PrimaryKey(columns.clone()))
+                }
+                ConstraintDef::Unique { name, columns } => {
+                    (name.clone(), ConstraintKind::Unique(columns.clone()))
+                }
+                ConstraintDef::Check { name, expr } => {
+                    let bound = Binder::new(cat, txn).bind_check(table, columns, expr)?;
+                    let mut used = Vec::new();
+                    bound.walk(&mut |e| {
+                        if let Expr::Column(c) = e
+                            && !used.contains(c)
+                        {
+                            used.push(*c);
+                        }
+                    });
+                    let base = match used.as_slice() {
+                        [c] => format!("{table}_{}_check", columns[*c].name),
+                        _ => format!("{table}_check"),
+                    };
+                    let name = name.clone().unwrap_or_else(|| {
+                        let mut n = base.clone();
+                        let mut k = 0;
+                        while taken.contains(&n) {
+                            k += 1;
+                            n = format!("{base}{k}");
+                        }
+                        taken.push(n.clone());
+                        n
+                    });
+                    out.push(NewConstraint {
+                        name,
+                        kind: ConstraintKind::Check(expr.to_string()),
+                    });
+                    continue;
+                }
+            };
+            let name = match name {
+                Some(n) => n,
+                None => {
+                    let base = match &kind {
+                        ConstraintKind::PrimaryKey(_) => format!("{table}_pkey"),
+                        ConstraintKind::Unique(cols) => format!("{table}_{}_key", cols.join("_")),
+                        ConstraintKind::Check(_) => format!("{table}_check"),
+                    };
+                    let mut n = cat.choose_relation_name(txn, &base)?;
+                    let mut k = 0;
+                    while taken.contains(&n) {
+                        k += 1;
+                        n = cat.choose_relation_name(txn, &format!("{base}{k}"))?;
+                    }
+                    taken.push(n.clone());
+                    n
+                }
+            };
+            out.push(NewConstraint { name, kind });
+        }
+        Ok(out)
+    }
+
     fn optimize(&self, txn: &mut Transaction, plan: Plan) -> Result<Plan> {
         let cat = &self.db.catalog;
         planner::optimize(plan, &mut |t| Ok(cat.indexes_of(txn, t.oid)?))
@@ -417,7 +515,11 @@ impl Session {
                     notices: Vec::new(),
                 })
             }
-            Bound::Insert { table, source } => {
+            Bound::Insert {
+                table,
+                source,
+                rules,
+            } => {
                 let plan = self.optimize(txn, source)?;
                 let env = self.env(txn);
                 let rows = exec::run(&plan, &env)?;
@@ -426,6 +528,7 @@ impl Session {
                 let indexes = cat.table_indexes(txn, &table)?;
                 let desc = table.desc();
                 for row in &rows {
+                    check_row(&table, &rules, row)?;
                     let xid = txn.write_xid()?;
                     let t = form_tuple(&desc, row, xid, txn.command_id())?;
                     let tid = heap.insert(&t)?;
@@ -439,8 +542,9 @@ impl Session {
                 table,
                 scan,
                 assignments,
+                rules,
             } => {
-                let n = self.modify(txn, &table, scan, Some(&assignments))?;
+                let n = self.modify(txn, &table, scan, Some((&assignments, &rules)))?;
                 Ok(QueryResult::tag(format!("UPDATE {n}")))
             }
             Bound::Delete { table, scan } => {
@@ -462,7 +566,7 @@ impl Session {
         txn: &mut Transaction,
         table: &RelationInfo,
         scan: Plan,
-        assignments: Option<&[(usize, Expr)]>,
+        assignments: Option<(&[(usize, Expr)], &Rules)>,
     ) -> Result<u64> {
         let plan = self.optimize(txn, scan)?;
         let filter = match &plan {
@@ -483,11 +587,12 @@ impl Session {
             let (mut tid, mut row) = (first_tid, first_row);
             loop {
                 let result = match assignments {
-                    Some(set) => {
+                    Some((set, rules)) => {
                         let mut new_row = row.clone();
                         for (col, e) in set {
                             new_row[*col] = e.eval(&row)?;
                         }
+                        check_row(table, rules, &new_row)?;
                         let xid = txn.write_xid()?;
                         let t = form_tuple(&desc, &new_row, xid, txn.command_id())?;
                         let r = heap.update_waiting(tid, &t, txn)?;
@@ -536,6 +641,34 @@ impl Session {
         }
         Ok(count)
     }
+}
+
+/// NOT NULL and CHECK constraints for a row about to be stored.
+fn check_row(table: &RelationInfo, rules: &Rules, row: &[Value]) -> Result<()> {
+    for &c in &rules.not_null {
+        if row[c].is_null() {
+            return Err(SqlError::new(
+                code::NOT_NULL_VIOLATION,
+                format!(
+                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                    table.columns[c].name, table.name
+                ),
+            ));
+        }
+    }
+    for (name, e) in &rules.checks {
+        // Only FALSE fails; NULL passes.
+        if e.eval(row)? == Value::Bool(false) {
+            return Err(SqlError::new(
+                code::CHECK_VIOLATION,
+                format!(
+                    "new row for relation \"{}\" violates check constraint \"{name}\"",
+                    table.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn check_user_relation(oid: u32, name: &str) -> Result<()> {

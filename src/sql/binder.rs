@@ -33,6 +33,7 @@ pub enum Bound {
     Insert {
         table: RelationInfo,
         source: Plan,
+        rules: Rules,
     },
     /// `scan` is a scan of `table` with the WHERE clause as its filter;
     /// assignments are (column index, expression over the old row).
@@ -40,6 +41,7 @@ pub enum Bound {
         table: RelationInfo,
         scan: Plan,
         assignments: Vec<(usize, Expr)>,
+        rules: Rules,
     },
     Delete {
         table: RelationInfo,
@@ -54,9 +56,12 @@ pub enum Utility {
     Commit,
     Rollback,
     SetTransaction(Isolation),
+    /// Columns carry NOT NULL and DEFAULT (as SQL text); constraint names
+    /// are chosen and CHECK/DEFAULT expressions validated when executed.
     CreateTable {
         name: String,
         columns: Vec<Column>,
+        constraints: Vec<ConstraintDef>,
         if_not_exists: bool,
     },
     DropTable {
@@ -74,6 +79,31 @@ pub enum Utility {
         names: Vec<String>,
         if_exists: bool,
     },
+}
+
+/// A table constraint as written in CREATE TABLE.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstraintDef {
+    PrimaryKey {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    Unique {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    Check {
+        name: Option<String>,
+        expr: Box<ast::Expr>,
+    },
+}
+
+/// Row rules checked before a row is stored (PostgreSQL's
+/// ExecConstraints): NOT NULL columns, then CHECK constraints by name.
+#[derive(Debug, Clone, Default)]
+pub struct Rules {
+    pub not_null: Vec<usize>,
+    pub checks: Vec<(String, Expr)>,
 }
 
 /// Classified statement.
@@ -226,24 +256,141 @@ fn modes_isolation(modes: &[ast::TransactionMode]) -> Result<Option<Isolation>> 
     Ok(iso)
 }
 
-fn column_def(c: &ast::ColumnDef) -> Result<Column> {
-    for o in &c.options {
-        match o.option {
-            ast::ColumnOption::Null => {}
-            _ => {
-                return Err(SqlError::unsupported(format!(
-                    "column constraint {} (until step 10)",
-                    o.option
-                )));
-            }
-        }
+fn key_columns(cols: &[ast::IndexColumn]) -> Result<Vec<String>> {
+    cols.iter()
+        .map(
+            |c| match (&c.column.expr, &c.column.options.sort, &c.operator_class) {
+                (ast::Expr::Identifier(i), None, None) => Ok(ident(i)),
+                _ => Err(SqlError::unsupported(format!("key column {}", c.column))),
+            },
+        )
+        .collect()
+}
+
+fn plain_key(
+    index_name: &Option<ast::Ident>,
+    index_type: &Option<ast::IndexType>,
+    include: &[ast::Ident],
+    options: &[ast::IndexOption],
+    characteristics: &Option<ast::ConstraintCharacteristics>,
+) -> Result<()> {
+    if index_name.is_some()
+        || index_type.is_some()
+        || !include.is_empty()
+        || !options.is_empty()
+        || characteristics.is_some()
+    {
+        return Err(SqlError::unsupported("key constraint options"));
     }
-    Ok(Column {
-        name: ident(&c.name),
+    Ok(())
+}
+
+fn unique_def(
+    u: &ast::UniqueConstraint,
+    name: Option<String>,
+    columns: Vec<String>,
+) -> Result<ConstraintDef> {
+    plain_key(
+        &u.index_name,
+        &u.index_type,
+        &u.include,
+        &u.index_options,
+        &u.characteristics,
+    )?;
+    if matches!(u.nulls_distinct, ast::NullsDistinctOption::NotDistinct) {
+        return Err(SqlError::unsupported("NULLS NOT DISTINCT"));
+    }
+    Ok(ConstraintDef::Unique {
+        name: name.or_else(|| u.name.as_ref().map(ident)),
+        columns,
+    })
+}
+
+fn pk_def(
+    p: &ast::PrimaryKeyConstraint,
+    name: Option<String>,
+    columns: Vec<String>,
+) -> Result<ConstraintDef> {
+    plain_key(
+        &p.index_name,
+        &p.index_type,
+        &p.include,
+        &p.index_options,
+        &p.characteristics,
+    )?;
+    Ok(ConstraintDef::PrimaryKey {
+        name: name.or_else(|| p.name.as_ref().map(ident)),
+        columns,
+    })
+}
+
+fn check_def(c: &ast::CheckConstraint, name: Option<String>) -> Result<ConstraintDef> {
+    if c.no_inherit || c.enforced == Some(false) {
+        return Err(SqlError::unsupported(format!("{c}")));
+    }
+    Ok(ConstraintDef::Check {
+        name: name.or_else(|| c.name.as_ref().map(ident)),
+        expr: c.expr.clone(),
+    })
+}
+
+/// A column definition and the constraints written on it.
+fn column_def(c: &ast::ColumnDef, table: &str, out: &mut Vec<ConstraintDef>) -> Result<Column> {
+    let name = ident(&c.name);
+    let mut col = Column {
+        name: name.clone(),
         ty: data_type(&c.data_type)?,
         not_null: false,
         default: None,
-    })
+    };
+    let (mut saw_null, mut saw_not_null) = (false, false);
+    for o in &c.options {
+        let cname = o.name.as_ref().map(ident);
+        match &o.option {
+            ast::ColumnOption::Null => saw_null = true,
+            ast::ColumnOption::NotNull => saw_not_null = true,
+            ast::ColumnOption::Default(e) => {
+                if col.default.is_some() {
+                    return Err(err(
+                        code::SYNTAX_ERROR,
+                        format!(
+                            "multiple default values specified for column \"{name}\" of table \"{table}\""
+                        ),
+                    ));
+                }
+                col.default = Some(e.to_string());
+            }
+            ast::ColumnOption::PrimaryKey(p) => out.push(pk_def(p, cname, vec![name.clone()])?),
+            ast::ColumnOption::Unique(u) => out.push(unique_def(u, cname, vec![name.clone()])?),
+            ast::ColumnOption::Check(ch) => out.push(check_def(ch, cname)?),
+            other => {
+                return Err(SqlError::unsupported(format!("column option {other}")));
+            }
+        }
+    }
+    if saw_null && saw_not_null {
+        return Err(err(
+            code::SYNTAX_ERROR,
+            format!(
+                "conflicting NULL/NOT NULL declarations for column \"{name}\" of table \"{table}\""
+            ),
+        ));
+    }
+    col.not_null = saw_not_null;
+    Ok(col)
+}
+
+/// Parses an expression stored as SQL text in the catalog.
+pub fn parse_expr(text: &str) -> Result<ast::Expr> {
+    Ok(
+        sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+            .try_with_sql(text)?
+            .parse_expr()?,
+    )
+}
+
+fn is_default_keyword(e: &ast::Expr) -> bool {
+    matches!(e, ast::Expr::Identifier(i) if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("default"))
 }
 
 /// Splits off statements that need no catalog binding.
@@ -268,14 +415,28 @@ pub fn classify(stmt: &ast::Statement) -> Result<Kind<'_>> {
             None => return Err(SqlError::unsupported(format!("statement {stmt}"))),
         },
         S::CreateTable(ct) => {
-            if ct.query.is_some() || !ct.constraints.is_empty() || ct.temporary {
+            if ct.query.is_some() || ct.temporary {
                 return Err(SqlError::unsupported(format!("statement {stmt}")));
             }
+            let table = object_name(&ct.name)?;
+            let mut constraints = Vec::new();
             let columns = ct
                 .columns
                 .iter()
-                .map(column_def)
+                .map(|c| column_def(c, &table, &mut constraints))
                 .collect::<Result<Vec<_>>>()?;
+            for tc in &ct.constraints {
+                constraints.push(match tc {
+                    ast::TableConstraint::PrimaryKey(p) => {
+                        pk_def(p, None, key_columns(&p.columns)?)?
+                    }
+                    ast::TableConstraint::Unique(u) => {
+                        unique_def(u, None, key_columns(&u.columns)?)?
+                    }
+                    ast::TableConstraint::Check(c) => check_def(c, None)?,
+                    other => return Err(SqlError::unsupported(format!("constraint {other}"))),
+                });
+            }
             for (i, c) in columns.iter().enumerate() {
                 if columns[..i].iter().any(|d| d.name == c.name) {
                     return Err(err(
@@ -285,8 +446,9 @@ pub fn classify(stmt: &ast::Statement) -> Result<Kind<'_>> {
                 }
             }
             Utility::CreateTable {
-                name: object_name(&ct.name)?,
+                name: table,
                 columns,
+                constraints,
                 if_not_exists: ct.if_not_exists,
             }
         }
@@ -520,6 +682,8 @@ enum Clause {
     Values,
     Update,
     Limit,
+    Check,
+    Default,
     /// SELECT list, HAVING, ORDER BY: aggregates allowed.
     Select,
 }
@@ -533,6 +697,8 @@ impl Clause {
             Clause::Values => "VALUES",
             Clause::Update => "UPDATE",
             Clause::Limit => "LIMIT",
+            Clause::Check => "check constraints",
+            Clause::Default => "DEFAULT expressions",
             Clause::Select => "SELECT",
         }
     }
@@ -1182,7 +1348,8 @@ impl<'a> Binder<'a> {
             return Err(SqlError::unsupported(format!("statement {i}")));
         };
         let table = self.open_target(name)?;
-        let targets: Vec<usize> = if i.columns.is_empty() {
+        let implicit_targets = i.columns.is_empty();
+        let mut targets: Vec<usize> = if implicit_targets {
             (0..table.columns.len()).collect()
         } else {
             let mut t = Vec::new();
@@ -1211,9 +1378,37 @@ impl<'a> Binder<'a> {
             }
             t
         };
+        let defaults = self.defaults(&table)?;
+        let rules = self.rules(&table)?;
         let Some(src) = &i.source else {
-            return Err(SqlError::unsupported("INSERT DEFAULT VALUES"));
+            // INSERT ... DEFAULT VALUES
+            return Ok(Bound::Insert {
+                source: Plan::Values {
+                    rows: vec![defaults],
+                    width: table.columns.len(),
+                },
+                table,
+                rules,
+            });
         };
+        // Without a column list, a shorter row fills the leading columns.
+        if implicit_targets {
+            let width = match src.body.as_ref() {
+                ast::SetExpr::Values(v) => v.rows.first().map_or(0, |r| r.len()),
+                ast::SetExpr::Select(sel)
+                    if !sel.projection.iter().any(|p| {
+                        matches!(
+                            p,
+                            ast::SelectItem::Wildcard(_) | ast::SelectItem::QualifiedWildcard(..)
+                        )
+                    }) =>
+                {
+                    sel.projection.len()
+                }
+                _ => targets.len(),
+            };
+            targets.truncate(width.max(1).min(targets.len()));
+        }
         let check_width = |n: usize| -> Result<()> {
             if n > targets.len() {
                 Err(err(
@@ -1247,7 +1442,7 @@ impl<'a> Binder<'a> {
             })
         };
         let full_row = |vals: Vec<Expr>| -> Vec<Expr> {
-            let mut row = vec![Expr::Const(Value::Null); table.columns.len()];
+            let mut row = defaults.clone();
             for (v, &col) in vals.into_iter().zip(&targets) {
                 row[col] = v;
             }
@@ -1268,6 +1463,10 @@ impl<'a> Binder<'a> {
                 check_width(r.len())?;
                 let mut vals = Vec::new();
                 for (e, &col) in r.iter().zip(&targets) {
+                    if is_default_keyword(e) {
+                        vals.push(defaults[col].clone());
+                        continue;
+                    }
                     let b = self.bind_expr(e, &Scope::default(), Clause::Values)?;
                     vals.push(assign(b, col)?);
                 }
@@ -1291,7 +1490,87 @@ impl<'a> Binder<'a> {
                 exprs: full_row(vals),
             }
         };
-        Ok(Bound::Insert { table, source })
+        Ok(Bound::Insert {
+            table,
+            source,
+            rules,
+        })
+    }
+
+    /// The DEFAULT expression of each column of `table` (NULL if none).
+    fn defaults(&mut self, table: &RelationInfo) -> Result<Vec<Expr>> {
+        table
+            .columns
+            .iter()
+            .map(|c| match &c.default {
+                Some(text) => self.bind_default(c, &parse_expr(text)?),
+                None => Ok(Expr::Const(Value::Null)),
+            })
+            .collect()
+    }
+
+    /// NOT NULL columns and bound CHECK constraints of `table`.
+    fn rules(&mut self, table: &RelationInfo) -> Result<Rules> {
+        let mut checks = Vec::new();
+        for c in self.cat.constraints_of(self.txn, table.oid)? {
+            if let Some(text) = &c.check {
+                let e = self.bind_check(&table.name, &table.columns, &parse_expr(text)?)?;
+                checks.push((c.name, e));
+            }
+        }
+        checks.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Rules {
+            not_null: (0..table.columns.len())
+                .filter(|&i| table.columns[i].not_null)
+                .collect(),
+            checks,
+        })
+    }
+
+    /// Binds a CHECK expression over the columns of a table.
+    pub fn bind_check(&mut self, table: &str, columns: &[Column], e: &ast::Expr) -> Result<Expr> {
+        let scope = Scope {
+            cols: columns
+                .iter()
+                .map(|c| ScopeCol {
+                    table: table.to_owned(),
+                    name: c.name.clone(),
+                    ty: c.ty,
+                })
+                .collect(),
+        };
+        let b = self.bind_expr(e, &scope, Clause::Check)?;
+        to_bool(b, "CHECK")
+    }
+
+    /// Binds a DEFAULT expression for column `col` (no column references).
+    pub fn bind_default(&mut self, col: &Column, e: &ast::Expr) -> Result<Expr> {
+        let b = self
+            .bind_expr(e, &Scope::default(), Clause::Default)
+            .map_err(|e| {
+                if e.code == code::UNDEFINED_COLUMN {
+                    err(
+                        code::INVALID_COLUMN_REFERENCE,
+                        "cannot use column reference in DEFAULT expression",
+                    )
+                } else {
+                    e
+                }
+            })?;
+        let found = b.ty.name();
+        coerce(b, col.ty, Coercion::Assignment).map_err(|e| {
+            if e.code == code::DATATYPE_MISMATCH {
+                err(
+                    code::DATATYPE_MISMATCH,
+                    format!(
+                        "column \"{}\" is of type {} but default expression is of type {found}",
+                        col.name, col.ty
+                    ),
+                )
+            } else {
+                e
+            }
+        })
     }
 
     fn table_scope(table: &RelationInfo, label: &str) -> Scope {
@@ -1351,6 +1630,15 @@ impl<'a> Binder<'a> {
                     format!("multiple assignments to same column \"{n}\""),
                 ));
             }
+            if is_default_keyword(&a.value) {
+                let c = table.columns[col].clone();
+                let e = match &c.default {
+                    Some(text) => self.bind_default(&c, &parse_expr(text)?)?,
+                    None => Expr::Const(Value::Null),
+                };
+                assignments.push((col, e));
+                continue;
+            }
             let b = self.bind_expr(&a.value, &scope, Clause::Update)?;
             let c = &table.columns[col];
             let found = b.ty.name();
@@ -1373,6 +1661,7 @@ impl<'a> Binder<'a> {
             Some(w) => Some(self.bind_bool(w, &scope, Clause::Where)?),
             None => None,
         };
+        let rules = self.rules(&table)?;
         Ok(Bound::Update {
             scan: Plan::Scan {
                 table: table.clone(),
@@ -1380,6 +1669,7 @@ impl<'a> Binder<'a> {
             },
             table,
             assignments,
+            rules,
         })
     }
 
