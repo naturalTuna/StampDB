@@ -88,6 +88,16 @@ pub trait TransactionManager: Send + Sync + fmt::Debug {
     /// A snapshot of the transactions running now.
     fn snapshot(&self) -> Snapshot;
 
+    /// A snapshot for transaction `txn`, registering its xmin so vacuum
+    /// keeps what it can see.
+    fn snapshot_for(&self, txn: TxnId) -> Snapshot;
+
+    /// Forgets `txn`'s registered snapshot.
+    fn release_snapshot(&self, txn: TxnId);
+
+    /// Vacuum horizon: changes committed before this xid are seen by all.
+    fn oldest_xmin(&self) -> Xid;
+
     /// Commit state of `xid` from the commit log.
     fn status(&self, xid: Xid) -> Result<XidStatus>;
 

@@ -159,6 +159,13 @@ mod tests {
         fn snapshot(&self) -> Snapshot {
             unreachable!()
         }
+        fn snapshot_for(&self, _: TxnId) -> Snapshot {
+            unreachable!()
+        }
+        fn release_snapshot(&self, _: TxnId) {}
+        fn oldest_xmin(&self) -> Xid {
+            Xid::INVALID
+        }
         fn status(&self, xid: Xid) -> crate::txn::Result<XidStatus> {
             Ok(self.0.get(&xid).copied().unwrap_or(XidStatus::InProgress))
         }

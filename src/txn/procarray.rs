@@ -7,7 +7,7 @@
 //! the commit log, so a snapshot cannot see a transaction as finished
 //! before the commit log knows its outcome.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
@@ -18,6 +18,9 @@ use super::{Snapshot, TxnId, Xid};
 struct State {
     next_xid: Xid,
     running: BTreeSet<Xid>,
+    /// xmin of the snapshot each transaction is using (PostgreSQL's
+    /// MyProc->xmin): tuples deleted before it may still be visible to it.
+    xmins: HashMap<TxnId, Xid>,
 }
 
 /// The set of running transactions.
@@ -34,6 +37,7 @@ impl ProcArray {
             state: Mutex::new(State {
                 next_xid,
                 running: BTreeSet::new(),
+                xmins: HashMap::new(),
             }),
             next_txn: AtomicU64::new(1),
         }
@@ -69,7 +73,39 @@ impl ProcArray {
 
     /// Takes a snapshot of the running set.
     pub fn snapshot(&self) -> Snapshot {
+        Self::take(&self.state.lock())
+    }
+
+    /// Takes a snapshot for `txn` and registers its xmin, under the same
+    /// lock, so a concurrent vacuum horizon cannot pass it.
+    pub fn snapshot_for(&self, txn: TxnId) -> Snapshot {
+        let mut s = self.state.lock();
+        let snap = Self::take(&s);
+        s.xmins.insert(txn, snap.xmin);
+        snap
+    }
+
+    /// Forgets `txn`'s registered snapshot (at transaction end).
+    pub fn release_snapshot(&self, txn: TxnId) {
+        self.state.lock().xmins.remove(&txn);
+    }
+
+    /// The oldest xid any running transaction or registered snapshot may
+    /// still consider in progress. A tuple deleted by a transaction that
+    /// committed before it is dead to everyone (vacuum horizon).
+    pub fn oldest_xmin(&self) -> Xid {
         let s = self.state.lock();
+        let mut oldest = s.next_xid;
+        if let Some(&x) = s.running.first() {
+            oldest = oldest.min(x);
+        }
+        if let Some(&x) = s.xmins.values().min() {
+            oldest = oldest.min(x);
+        }
+        oldest
+    }
+
+    fn take(s: &State) -> Snapshot {
         let running: Vec<Xid> = s.running.iter().copied().collect();
         Snapshot {
             xmin: running.first().copied().unwrap_or(s.next_xid),
@@ -105,6 +141,27 @@ mod tests {
         let s3 = pa.snapshot();
         assert_eq!((s3.xmin, s3.xmax), (Xid(12), Xid(12)));
         assert!(s3.running.is_empty());
+    }
+
+    #[test]
+    fn oldest_xmin_follows_running_and_registered_snapshots() {
+        let pa = ProcArray::new(Xid(10));
+        assert_eq!(pa.oldest_xmin(), Xid(10));
+        let a = pa.assign_xid(); // 10
+        let reader = TxnId(99);
+        let snap = pa.snapshot_for(reader);
+        assert_eq!(snap.xmin, a);
+        pa.remove(a);
+        let b = pa.assign_xid(); // 11
+        assert_eq!(
+            pa.oldest_xmin(),
+            a,
+            "the reader's snapshot still sees 10 running"
+        );
+        pa.release_snapshot(reader);
+        assert_eq!(pa.oldest_xmin(), b);
+        pa.remove(b);
+        assert_eq!(pa.oldest_xmin(), Xid(12));
     }
 
     #[test]

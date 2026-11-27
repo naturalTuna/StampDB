@@ -72,6 +72,18 @@ impl TransactionManager for LocalTxnManager {
         self.procs.snapshot()
     }
 
+    fn snapshot_for(&self, txn: TxnId) -> Snapshot {
+        self.procs.snapshot_for(txn)
+    }
+
+    fn release_snapshot(&self, txn: TxnId) {
+        self.procs.release_snapshot(txn)
+    }
+
+    fn oldest_xmin(&self) -> Xid {
+        self.procs.oldest_xmin()
+    }
+
     fn status(&self, xid: Xid) -> Result<XidStatus> {
         // Running first: a committing transaction's bits may already be set
         // before its commit record is durable.

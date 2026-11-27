@@ -1625,6 +1625,29 @@ mod tests {
         }
 
         #[test]
+        fn snapshots_hold_the_vacuum_horizon() {
+            let e = env();
+            let tm = e.engine.txn().clone();
+            let mut si = e.begin(Isolation::SnapshotIsolation);
+            let mut rc = e.begin(Isolation::ReadCommitted);
+            si.statement_snapshot();
+            rc.statement_snapshot();
+            let held = tm.oldest_xmin();
+            for i in 0..3 {
+                committed_row(&e, i);
+            }
+            rc.statement_snapshot();
+            si.statement_snapshot();
+            assert_eq!(tm.oldest_xmin(), held, "SI keeps its first snapshot's xmin");
+            si.commit().unwrap();
+            rc.statement_snapshot();
+            let advanced = tm.oldest_xmin();
+            assert!(advanced > held, "RC moves its xmin with each statement");
+            rc.commit().unwrap();
+            assert_eq!(tm.oldest_xmin(), tm.next_xid(), "nothing holds it back");
+        }
+
+        #[test]
         fn uncommitted_rows_are_invisible_after_crash() {
             let e = env();
             committed_row(&e, 1);

@@ -125,7 +125,7 @@ impl Transaction {
         match (&self.snapshot, self.isolation) {
             (Some(s), Isolation::SnapshotIsolation) => s.clone(),
             _ => {
-                let s = self.tm.snapshot();
+                let s = self.tm.snapshot_for(self.id);
                 self.snapshot = Some(s.clone());
                 s
             }
@@ -176,6 +176,7 @@ impl Transaction {
         };
         // Locks go after the outcome is recorded, so waiters see it.
         self.locks.release_all(self.id);
+        self.tm.release_snapshot(self.id);
         Ok(res?)
     }
 }
