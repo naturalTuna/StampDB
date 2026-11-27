@@ -4,6 +4,9 @@
 decisions의 변경은 채팅 리뷰를 거친 뒤에만 반영하고, 반영 시 아래 변경 이력에 남긴다.
 
 ## 변경 이력
+- r11 (2026-11-27)
+  - [추가] SQL 실행: 9단계 SQL 범위, 규칙 기반 플래너, 메모리 내 hash join/집계/정렬(spill 없음), PG 텍스트 출력 형식, PG 타입 규칙과 NUMERIC 전까지의 처리.
+  - [추가] sqllogictest 기대값은 개발 VM의 사용자 디렉터리에 소스 빌드한 PostgreSQL 18(C locale)로 생성한다.
 - r10 (2026-11-27)
   - [추가] 카탈로그: 내부 이름 sys_class/sys_attribute/sys_index (pg_catalog는 이후 뷰), 처음에는 캐시 없이 MVCC 조회.
   - [추가] 이름 중복은 sys_class(relname) unique 인덱스로 막는다. 이를 위해 10단계의 B+Tree unique 검사를 8단계에 앞당겨 구현한다.
@@ -248,6 +251,20 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - OID는 16384부터 하나의 카운터로 발급하고 relfilenode = oid로 시작한다. control 파일과 8192개마다의 NEXTOID WAL 레코드로 보존해 크래시 후 재사용하지 않는다.
 - 파일 생명주기는 PG의 pending deletes: CREATE는 즉시 파일을 만들고 abort 시 삭제, DROP은 커밋 후 삭제. COMMIT/ABORT 레코드가 삭제할 relation 목록을 담아 redo에서도 삭제한다. 크래시 당시 진행 중이던 CREATE의 파일은 남을 수 있다 (PG와 같은 한계).
 - CREATE INDEX는 테이블에 Share lock을 잡고 기존 행 중 죽지 않은 버전을 모두 색인한다 (CONCURRENTLY 미지원).
+
+[SQL 실행]
+- 9단계 범위: CREATE/DROP TABLE·INDEX, INSERT(VALUES, SELECT), SELECT(WHERE, INNER/LEFT JOIN, GROUP BY, 집계 count/sum/avg/min/max, HAVING, ORDER BY, LIMIT/OFFSET, DISTINCT), UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK와 격리 수준 지정.
+  서브쿼리, 윈도 함수, CTE는 이후로 미룬다.
+- 플래너는 통계(12단계) 전까지 규칙 기반이다: WHERE에 인덱스 선두 컬럼의 등호·범위 조건이 있으면 index scan, 등호 조인은 hash join, 나머지는 nested loop. 인덱스 조건으로 고른 행도 WHERE 전체로 다시 검사한다.
+- hash join, 집계, 정렬, DISTINCT는 메모리 안에서만 처리한다 (work_mem 초과 시 디스크 spill 없음).
+- 타입 규칙은 PG를 따른다: 정수 리터럴은 int4(넘치면 int8), 문자열 리터럴은 문맥 타입으로 변환되는 unknown, 정수 나눗셈은 정수, 정수 overflow와 0 나누기는 오류, NULL은 3값 논리.
+  소수 리터럴은 PG처럼 numeric이다. NUMERIC 구현 전에는 float8로 암묵 변환되는 문맥에서만 허용하고, 결과가 numeric이 되는 식(소수 리터럴 단독, avg(정수), sum(int8))은 0A000 오류로 거부한다.
+  근거: 다른 타입으로 계산하면 출력이 PG와 달라 sqllogictest 비교가 깨진다.
+- 값의 텍스트 출력은 PG와 같다: float8은 최단 왕복 표현(지수 -4 미만 또는 15 이상이면 지수 표기, Infinity/NaN), timestamp는 `YYYY-MM-DD HH:MM:SS[.ffffff]`(뒤 0 제거), bool은 t/f.
+- 오류는 PG SQLSTATE 코드를 갖는다 (13단계 ErrorResponse에 그대로 싣는다).
+- 세션은 문장마다 자동 커밋하고, BEGIN 이후에는 명시적 트랜잭션이다. 트랜잭션 안에서 오류가 나면 ROLLBACK 전까지 모든 문장을 25P02로 거부한다 (PG와 동일). COMMIT은 이때 ROLLBACK으로 처리한다.
+- 문장은 참조하는 테이블을 카탈로그에서 찾은 뒤 lock을 잡고(SELECT는 AccessShare, DML은 RowExclusive), lock 후 다시 조회해 바뀌었으면 바인딩을 다시 한다.
+- RC의 UPDATE/DELETE는 대상 테이블 하나에 대해 EvalPlanQual을 한다: 최신 버전을 가져와 WHERE를 재평가하고, 통과하면 새 값을 다시 계산해 갱신한다.
 
 [제약조건]
 - NOT NULL, CHECK, PRIMARY KEY, UNIQUE, FOREIGN KEY.
