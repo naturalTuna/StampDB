@@ -62,6 +62,8 @@ pub mod info {
     pub const NEWROOT: u8 = 3;
     /// Block 0 metapage, block 1 root leaf (images).
     pub const CREATE: u8 = 4;
+    /// Block 0: slots removed by vacuum, u16 each, in removal order.
+    pub const BULK_DELETE: u8 = 5;
 
     /// SPLIT main-data flag: an old right sibling block follows.
     pub const SPLIT_HAS_SIBLING: u8 = 0x01;
@@ -213,6 +215,67 @@ impl BTree {
             }
             return Ok(false);
         }
+    }
+
+    /// Removes every leaf entry whose TID satisfies `dead` (vacuum's index
+    /// cleanup; PostgreSQL's btbulkdelete). Returns how many were removed.
+    ///
+    /// Leaves are visited in block order up to the end of the file, re-read
+    /// until it stops growing: a concurrent split only moves entries to a
+    /// newly appended block (deleted pages are never reused), so no entry
+    /// can move to a block already passed.
+    pub fn bulk_delete(&self, dead: &dyn Fn(Tid) -> bool) -> Result<usize> {
+        let mut removed = 0;
+        let mut blk = META_BLOCK + 1;
+        loop {
+            let n = self.pool.nblocks(self.rel)?;
+            if blk >= n {
+                return Ok(removed);
+            }
+            while blk < n {
+                removed += self.bulk_delete_page(blk, dead)?;
+                blk += 1;
+            }
+        }
+    }
+
+    fn bulk_delete_page(&self, blk: u32, dead: &dyn Fn(Tid) -> bool) -> Result<usize> {
+        let pin = self.fetch(blk)?;
+        let mut page = pin.write();
+        if crate::storage::page::is_new_page(&page) {
+            return Ok(0);
+        }
+        let mut node = Node::open(&mut page[..])?;
+        let op = node.opaque();
+        if !op.is_leaf() || op.flags & (flags::DELETED | flags::HALF_DEAD) != 0 {
+            return Ok(0);
+        }
+        let mut slots = Vec::new();
+        for s in node.first_data()..node.slot_count() {
+            let entry = node.key_at(s)?;
+            let cut = entry
+                .len()
+                .checked_sub(TID_LEN)
+                .ok_or(BTreeError::Corrupt("leaf entry shorter than tid"))?;
+            if dead(decode_tid(&entry[cut..])?) {
+                slots.push(s);
+            }
+        }
+        // Highest first, so earlier slots keep their numbers.
+        slots.reverse();
+        for &s in &slots {
+            node.remove_at(s)?;
+        }
+        if slots.is_empty() {
+            return Ok(0);
+        }
+        page.mark_dirty();
+        let mut b = BlockRef::new(self.rel, BlockNumber(blk));
+        b.data = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut rec = Record::new(RmgrId::Btree, info::BULK_DELETE);
+        rec.blocks.push(b);
+        self.log(rec, &mut [&mut page[..]]);
+        Ok(slots.len())
     }
 
     /// Entries whose key lies within the bounds, in key order (then TID).
@@ -617,6 +680,13 @@ pub fn redo(rec: &Record, idx: usize, page: &mut [u8]) -> Result<()> {
         }
         (info::INSERT, 1) => clear_flags(page, flags::INCOMPLETE_SPLIT),
         (info::DELETE, 0) => Node::open(page)?.remove_at(slot()?),
+        (info::BULK_DELETE, 0) => {
+            let mut node = Node::open(page)?;
+            for c in d.as_chunks::<2>().0 {
+                node.remove_at(u16::from_le_bytes(*c))?;
+            }
+            Ok(())
+        }
         (info::SPLIT, i) if i >= 2 => {
             let split_flags = rec.main.first().copied().unwrap_or(0);
             let has_sibling = split_flags & info::SPLIT_HAS_SIBLING != 0;
@@ -1383,6 +1453,65 @@ mod tests {
         tree.insert(&key(0, 500), tid(50_000)).unwrap();
         assert_eq!(tree.height().unwrap(), 2);
         assert_eq!(check_invariants(&tree).len(), n as usize + 1);
+    }
+
+    #[test]
+    fn bulk_delete_removes_dead_tids_and_replays() {
+        let (mem, pool, tree) = setup_wal();
+        let mut model = BTreeSet::new();
+        for i in 0..1200u32 {
+            let e = (key((i % 300) as i64, 120), tid(i));
+            tree.insert(&e.0, e.1).unwrap();
+            model.insert(e);
+        }
+        let dead = |t: Tid| t.slot.0.is_multiple_of(3);
+        let n = tree.bulk_delete(&dead).unwrap();
+        model.retain(|(_, t)| !dead(*t));
+        assert_eq!(n, 1200 - model.len());
+        assert_eq!(all(&tree), model.iter().cloned().collect::<Vec<_>>());
+        assert_eq!(tree.bulk_delete(&dead).unwrap(), 0, "idempotent");
+        check_invariants(&tree);
+
+        pool.wal().unwrap().flush_all();
+        let replayed = replay(&mem);
+        for blk in 0..pool.nblocks(REL).unwrap() {
+            let pin = tree.fetch(blk).unwrap();
+            let mut live = pin.read().to_vec();
+            live[8..12].fill(0);
+            let mut want = replayed
+                .get(&blk)
+                .cloned()
+                .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
+            want[8..12].fill(0);
+            assert_eq!(live, want, "block {blk} differs after replay");
+        }
+    }
+
+    #[test]
+    fn bulk_delete_with_concurrent_splits() {
+        let (_pool, tree) = concurrent_setup(2);
+        for i in 0..400u32 {
+            tree.insert(&key(i as i64 * 2, 150), tid(i)).unwrap();
+        }
+        // Dead: the original entries with even TID numbers.
+        let dead = |t: Tid| t.blk.0 < 4 && t.slot.0.is_multiple_of(2);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // Inserts between the existing keys keep splitting pages.
+                for i in 0..400u32 {
+                    let t = Tid {
+                        blk: BlockNumber(100 + i / 100),
+                        slot: SlotId((i % 100) as u16),
+                    };
+                    fail_on_exhausted(tree.insert(&key(i as i64 * 2 + 1, 150), t), "insert");
+                }
+            });
+            fail_on_exhausted(tree.bulk_delete(&dead), "bulk delete");
+        });
+        let left: Vec<Tid> = all(&tree).into_iter().map(|(_, t)| t).collect();
+        assert!(left.iter().all(|t| !dead(*t)), "no dead entry survives");
+        assert_eq!(left.len(), 200 + 400);
+        check_invariants(&tree);
     }
 
     fn in_range(k: &[u8], lo: &Bound<Vec<u8>>, hi: &Bound<Vec<u8>>) -> bool {
