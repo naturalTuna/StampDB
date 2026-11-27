@@ -4,6 +4,12 @@
 decisions의 변경은 채팅 리뷰를 거친 뒤에만 반영하고, 반영 시 아래 변경 이력에 남긴다.
 
 ## 변경 이력
+- r10 (2026-11-27)
+  - [추가] 카탈로그: 내부 이름 sys_class/sys_attribute/sys_index (pg_catalog는 이후 뷰), 처음에는 캐시 없이 MVCC 조회.
+  - [추가] 이름 중복은 sys_class(relname) unique 인덱스로 막는다. 이를 위해 10단계의 B+Tree unique 검사를 8단계에 앞당겨 구현한다.
+  - [추가] Xid(1)은 항상 커밋된 부트스트랩 xid, 일반 xid는 2부터.
+  - [추가] 파일 삭제는 PG pending deletes 방식. OID는 16384부터 카운터 하나(relfilenode = oid), control 파일과 NEXTOID WAL로 보존.
+  - [추가] CREATE INDEX는 테이블 Share lock (CONCURRENTLY 미지원).
 - r9 (2026-11-27)
   - [이동] open_questions의 DDL 트랜잭션성을 decisions로 이동: PG처럼 트랜잭션 DDL, 카탈로그는 MVCC 테이블.
 - r8 (2026-11-27)
@@ -235,6 +241,13 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
   카탈로그는 일반 MVCC heap 테이블로 두고, DDL은 카탈로그 행의 삽입/삭제로 표현한다.
   근거: 기존 MVCC/WAL/vacuum을 재사용하고, 크래시 후에도 커밋 기준으로 정확하며, reader 노드가 WAL 재생만으로 카탈로그를 일관되게 읽는다. sqllogictest의 PG 비교와도 맞는다.
   비용: 카탈로그 캐시 무효화, DROP한 파일의 커밋 후 삭제, 롤백된 CREATE의 파일 정리가 필요하다.
+- 시스템 테이블은 내부 이름 sys_class(relation), sys_attribute(컬럼), sys_index(인덱스 정의)를 쓰고, 16384 미만의 고정 relation id를 갖는다. pg_catalog 호환은 이후 이 위의 뷰로 제공한다.
+- 처음에는 카탈로그 캐시를 두지 않는다. 조회는 트랜잭션 스냅샷으로 카탈로그 인덱스를 통해 MVCC로 읽는다 (자기 트랜잭션의 미커밋 DDL도 보인다).
+- relation 이름 중복은 sys_class(relname) unique 인덱스로 막는다. B+Tree unique 검사(PG의 _bt_check_unique: 같은 키의 heap 튜플을 넣은 트랜잭션이 진행 중이면 종료를 기다린 뒤 재확인, 커밋된 살아 있는 행이면 중복 오류)는 이를 위해 8단계에서 구현하고 10단계 PK/UNIQUE가 재사용한다.
+- Xid(1)은 항상 커밋된 것으로 취급하는 부트스트랩 xid다 (initdb가 쓰는 카탈로그 행). 일반 xid는 2부터.
+- OID는 16384부터 하나의 카운터로 발급하고 relfilenode = oid로 시작한다. control 파일과 8192개마다의 NEXTOID WAL 레코드로 보존해 크래시 후 재사용하지 않는다.
+- 파일 생명주기는 PG의 pending deletes: CREATE는 즉시 파일을 만들고 abort 시 삭제, DROP은 커밋 후 삭제. COMMIT/ABORT 레코드가 삭제할 relation 목록을 담아 redo에서도 삭제한다. 크래시 당시 진행 중이던 CREATE의 파일은 남을 수 있다 (PG와 같은 한계).
+- CREATE INDEX는 테이블에 Share lock을 잡고 기존 행 중 죽지 않은 버전을 모두 색인한다 (CONCURRENTLY 미지원).
 
 [제약조건]
 - NOT NULL, CHECK, PRIMARY KEY, UNIQUE, FOREIGN KEY.
