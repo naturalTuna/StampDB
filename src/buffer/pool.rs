@@ -217,6 +217,35 @@ impl BufferPool {
         Ok(self.flush_matching(|_| true)?.0)
     }
 
+    /// One background writer round: starting at the clock hand, writes up
+    /// to `max` dirty pages that are unpinned and have a usage count of
+    /// zero, i.e. the next replacement victims (PostgreSQL's bgwriter LRU
+    /// scan). Returns how many pages were written.
+    pub fn bgwriter_pass(&self, max: usize) -> Result<usize> {
+        let n = self.frames.len();
+        let start = self.clock_hand.load(Ordering::Relaxed);
+        let mut written = 0;
+        for k in 0..n {
+            if written >= max {
+                break;
+            }
+            let fid = FrameId((start + k) % n);
+            {
+                let mut h = self.frame(fid).hdr.lock();
+                if h.pin_count > 0 || !h.valid || !h.dirty || h.usage_count > 0 || h.tag.is_none() {
+                    continue;
+                }
+                h.pin_count += 1;
+            }
+            let res = self.flush_frame(fid);
+            self.unpin(fid);
+            if res? == FlushOutcome::Written {
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
+
     /// Syncs every relation written since its last sync.
     pub fn sync_pending(&self) -> Result<()> {
         Ok(self.disk.sync_pending()?)
@@ -1047,6 +1076,33 @@ mod tests {
             pool.drop_relation_buffers(REL),
             Err(BufferError::Pinned { rel: 1, blk: 0 })
         ));
+    }
+
+    #[test]
+    fn bgwriter_writes_only_upcoming_victims() {
+        let (mem, pool) = setup(8, 4);
+        for b in 0..4 {
+            modify(&pool, b, 0x11);
+        }
+        // Blocks 0 and 1 look like replacement victims; 2 is still hot.
+        for b in [0u32, 1, 2] {
+            let fid = *pool.partition(tag(b)).read().get(&tag(b)).unwrap();
+            pool.frame(fid).hdr.lock().usage_count = u8::from(b == 2);
+        }
+        let pinned = pool.fetch(tag(3)).unwrap();
+        pool.frame(*pool.partition(tag(3)).read().get(&tag(3)).unwrap())
+            .hdr
+            .lock()
+            .usage_count = 0;
+        let writes = mem.writes();
+        assert_eq!(pool.bgwriter_pass(10).unwrap(), 2);
+        assert_eq!(mem.writes(), writes + 2);
+        assert_eq!(pool.is_dirty(tag(0)), Some(false));
+        assert_eq!(pool.is_dirty(tag(1)), Some(false));
+        assert_eq!(pool.is_dirty(tag(2)), Some(true), "hot page left alone");
+        assert_eq!(pool.is_dirty(tag(3)), Some(true), "pinned page left alone");
+        drop(pinned);
+        assert_eq!(pool.bgwriter_pass(1).unwrap(), 1, "respects the page limit");
     }
 
     #[test]

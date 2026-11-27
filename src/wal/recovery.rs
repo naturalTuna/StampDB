@@ -194,11 +194,15 @@ impl Engine {
         ctl.1.redo = redo;
         let data = ctl.1;
         ctl.0.write(&data);
+        drop(ctl);
+        // Segments before the redo point are no longer needed.
+        self.wal.remove_segments_before(redo)?;
         Ok(redo)
     }
 
-    /// Checkpoints and marks the cluster cleanly shut down.
-    pub fn shutdown(self) -> Result<()> {
+    /// Checkpoints and marks the cluster cleanly shut down. Background
+    /// threads must be stopped first.
+    pub fn shutdown(&self) -> Result<()> {
         self.checkpoint()?;
         let mut ctl = self.control.lock();
         ctl.1.state = DbState::Shutdown;
@@ -284,7 +288,7 @@ mod tests {
     use crate::access::heap::HeapFile;
     use crate::access::tuple::{Tid, TupleDesc, TupleHeader, deform_tuple, form_tuple};
     use crate::buffer::SingleModeFlush;
-    use crate::storage::backend::{FenceToken, FileKey, FixedFence};
+    use crate::storage::backend::{FenceToken, FileKey, FixedFence, StorageBackend};
     use crate::storage::mem::MemBackend;
     use crate::storage::page::{BlockNumber, PAGE_SIZE};
     use crate::txn::CommandId;
@@ -487,6 +491,70 @@ mod tests {
         mem.remove(FileKey::Relation(IDX), FENCE).unwrap();
         let e = start(&mem, 32);
         assert_eq!(verify(&e), (0..50).collect());
+    }
+
+    #[test]
+    fn old_segments_are_removed_after_checkpoint() {
+        let mem = fresh();
+        let e = start(&mem, 32);
+        create_tables(&e);
+        load(&e, 0..3000);
+        e.wal().flush_all();
+        assert!(e.wal().insert_lsn().0 / cfg().segment_size >= 3);
+        let seg0 = FileKey::Wal {
+            timeline: 1,
+            segno: 0,
+        };
+        assert!(mem.file_len(seg0).is_ok());
+        let redo = e.checkpoint().unwrap();
+        assert!(
+            mem.file_len(seg0).is_err(),
+            "segment before the redo point removed"
+        );
+        let cur = FileKey::Wal {
+            timeline: 1,
+            segno: redo.0 / cfg().segment_size,
+        };
+        assert!(
+            mem.file_len(cur).is_ok(),
+            "segment holding the redo point kept"
+        );
+        load(&e, 3000..3100);
+        e.wal().flush_all();
+        drop(e);
+        let e = start(&mem, 32);
+        assert_eq!(verify(&e), (0..3100).collect());
+    }
+
+    #[test]
+    fn background_threads_then_crash() {
+        use crate::wal::{Background, BackgroundConfig};
+        use std::time::Duration;
+        let mem = fresh();
+        let e = Arc::new(start(&mem, 24));
+        create_tables(&e);
+        let bg = Background::start(
+            &e,
+            BackgroundConfig {
+                checkpoint_timeout: Duration::from_millis(30),
+                checkpoint_wal_bytes: 64 * 1024,
+                bgwriter_delay: Duration::from_millis(5),
+                bgwriter_max_pages: 8,
+            },
+        )
+        .unwrap();
+        let first_redo = e.control_data().redo;
+        load(&e, 0..1500);
+        e.wal().flush_all();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while e.control_data().redo == first_redo {
+            assert!(std::time::Instant::now() < deadline, "no checkpoint ran");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        bg.stop();
+        drop(e);
+        let e = start(&mem, 24);
+        assert_eq!(verify(&e), (0..1500).collect());
     }
 
     #[test]

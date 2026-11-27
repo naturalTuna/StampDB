@@ -101,6 +101,8 @@ struct FlushState {
     flushed: Lsn,
     /// Segments below this number are known to exist.
     created_upto: u64,
+    /// Segments below this number have been removed (or never existed).
+    removed_upto: u64,
 }
 
 /// The write side of the WAL.
@@ -188,6 +190,7 @@ impl Wal {
             flush: Mutex::new(FlushState {
                 flushed,
                 created_upto: 0,
+                removed_upto: 0,
             }),
         }
     }
@@ -307,6 +310,25 @@ impl Wal {
         let cut = (keep_from - g.buf_start) as usize;
         g.buf.drain(..cut);
         g.buf_start = keep_from;
+    }
+
+    /// Deletes the segments that lie entirely before `redo` (no longer
+    /// needed for recovery once a checkpoint with that redo point is
+    /// recorded in the control file). Returns how many files were removed.
+    pub fn remove_segments_before(&self, redo: Lsn) -> Result<usize> {
+        let keep_from = redo.0 / self.cfg.segment_size;
+        let mut f = self.flush.lock();
+        let mut removed = 0;
+        while f.removed_upto < keep_from {
+            let key = self.cfg.key(f.removed_upto);
+            match self.backend.remove(key, self.fence.fence_token()) {
+                Ok(()) => removed += 1,
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
+            f.removed_upto += 1;
+        }
+        Ok(removed)
     }
 
     /// Flushes everything inserted so far.

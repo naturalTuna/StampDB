@@ -1,5 +1,6 @@
 //! Write-ahead log: record format, log files, control file, and recovery.
 
+pub mod background;
 pub mod control;
 pub mod log;
 pub mod record;
@@ -7,6 +8,7 @@ pub mod recovery;
 
 use crate::storage::StorageError;
 
+pub use background::{Background, BackgroundConfig};
 pub use control::{ControlData, ControlFile, DbState};
 pub use log::{Wal, WalConfig, WalReader};
 pub use recovery::{Engine, RecoveryError, initdb};
