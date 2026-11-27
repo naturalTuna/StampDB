@@ -3,6 +3,7 @@
 pub mod btree;
 pub mod heap;
 pub mod tuple;
+pub mod visibility;
 
 use crate::wal::record::{Record, RmgrId};
 
