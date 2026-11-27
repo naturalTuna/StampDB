@@ -4,20 +4,32 @@
 //!   page's high key, the page has split since its parent was read: release
 //!   it and follow the right-link ("move right").
 //! * Insert remembers the parents it passed. A split builds the left and new
-//!   right pages under both locks, then locks the parent (moving right in
-//!   the parent level if it split too) before releasing the children, and
-//!   inserts the downlink. Locks are taken bottom-up and left-to-right only,
-//!   so writers cannot deadlock (as in PostgreSQL's nbtree).
+//!   right pages under both locks and marks the left page INCOMPLETE_SPLIT.
+//!   It then locks the parent (moving right in the parent level if it split
+//!   too), releases the right page, and inserts the downlink; that insert
+//!   clears the flag on the still-locked left page in the same WAL record.
+//!   Locks are taken bottom-up and left-to-right only, so writers cannot
+//!   deadlock (as in PostgreSQL's nbtree).
 //! * A split of the root creates a new root and updates the metapage while
 //!   still holding the old root's halves.
+//! * After a crash between a split and its downlink, the left page keeps
+//!   INCOMPLETE_SPLIT. Searches are unaffected (right-links), and an insert
+//!   that locks such a page, or passes it while looking for a parent,
+//!   inserts the missing downlink first (PostgreSQL's `_bt_finish_split`).
 //! * Scans copy one leaf at a time and remember its right-link, so a later
 //!   split of that leaf only moves entries that were already copied.
 //!
 //! Pins: an insert keeps every page of its split path pinned until it
 //! returns, up to about two per level plus the metapage.
+//!
+//! WAL: every change is logged while its pages are locked (see [`info`]);
+//! pages built from scratch by a split, a new root, or index creation are
+//! logged as full images. [`redo`] applies the other block references.
 
 use std::ops::Bound;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::key::{TID_LEN, decode_tid, encode_tid};
 use super::page::{
@@ -29,8 +41,33 @@ use crate::access::tuple::Tid;
 use crate::buffer::{BufferPool, BufferTag, PageMut, PinGuard};
 use crate::storage::backend::RelFileId;
 use crate::storage::page::BlockNumber;
+use crate::wal::log_and_stamp;
+use crate::wal::record::{BlockRef, Record, RmgrId};
 
 const META_BLOCK: u32 = 0;
+
+/// `info` values of B+Tree WAL records.
+pub mod info {
+    /// Block 0: `slot u16 | item`. Optional block 1: the child whose split
+    /// this downlink completes (clear INCOMPLETE_SPLIT).
+    pub const INSERT: u8 = 0;
+    /// Block 0: `slot u16`.
+    pub const DELETE: u8 = 1;
+    /// Block 0 left, block 1 right (images). Main data: one flags byte;
+    /// then, if flagged, the old right sibling (`prev u32`) and the child
+    /// whose split this split's downlink completes (clear the flag).
+    pub const SPLIT: u8 = 2;
+    /// Block 0 new root (image), block 1 old root (clear ROOT and
+    /// INCOMPLETE_SPLIT), block 2 metapage (`root u32 | level u32`).
+    pub const NEWROOT: u8 = 3;
+    /// Block 0 metapage, block 1 root leaf (images).
+    pub const CREATE: u8 = 4;
+
+    /// SPLIT main-data flag: an old right sibling block follows.
+    pub const SPLIT_HAS_SIBLING: u8 = 0x01;
+    /// SPLIT main-data flag: a child block follows.
+    pub const SPLIT_HAS_CHILD: u8 = 0x02;
+}
 
 /// Next step of a descent.
 enum Step {
@@ -44,9 +81,22 @@ enum Step {
 pub struct BTree {
     rel: RelFileId,
     pool: Arc<BufferPool>,
+    /// Test hook: return right after logging a split, as if the process
+    /// died before the downlink was inserted.
+    #[cfg(test)]
+    stop_after_split: AtomicBool,
 }
 
 impl BTree {
+    fn new(rel: RelFileId, pool: Arc<BufferPool>) -> Self {
+        Self {
+            rel,
+            pool,
+            #[cfg(test)]
+            stop_after_split: AtomicBool::new(false),
+        }
+    }
+
     /// Initializes an index in an empty relation file: metapage at block 0
     /// and an empty root leaf.
     pub fn create(rel: RelFileId, pool: Arc<BufferPool>) -> Result<Self> {
@@ -68,8 +118,6 @@ impl BTree {
             };
             build_page(&mut r, op, None, &[])?;
             r.mark_dirty();
-        }
-        {
             let mut m = mpin.write();
             build_meta(
                 &mut m,
@@ -79,14 +127,17 @@ impl BTree {
                 },
             )?;
             m.mark_dirty();
+            let mut rec = Record::new(RmgrId::Btree, info::CREATE);
+            rec.blocks = vec![image_block(rel, mblk.0, &m), image_block(rel, rblk.0, &r)];
+            log_and_stamp(pool.wal(), rec, &mut [&mut m[..], &mut r[..]]);
         }
         drop((rpin, mpin));
-        Ok(Self { rel, pool })
+        Ok(Self::new(rel, pool))
     }
 
     /// Opens an existing index.
     pub fn open(rel: RelFileId, pool: Arc<BufferPool>) -> Result<Self> {
-        let tree = Self { rel, pool };
+        let tree = Self::new(rel, pool);
         tree.meta()?;
         Ok(tree)
     }
@@ -99,10 +150,49 @@ impl BTree {
     /// Inserts the entry `key || tid`. `key` is a memcomparable key.
     pub fn insert(&self, key: &[u8], tid: Tid) -> Result<()> {
         let entry = entry_key(key, tid)?;
-        let (mut pin, mut blk, mut stack) = self.descend(&entry)?;
+        'restart: loop {
+            let (mut pin, mut blk, mut stack) = self.descend(&entry)?;
+            loop {
+                let mut page = pin.write();
+                let (incomplete, move_right, next) = {
+                    let node = Node::open(&page[..])?;
+                    (
+                        node.opaque().flags & flags::INCOMPLETE_SPLIT != 0,
+                        node.must_move_right(&entry)?,
+                        node.opaque().next,
+                    )
+                };
+                if incomplete {
+                    self.finish_split(blk, &mut page, 0, stack.clone())?;
+                    continue 'restart;
+                }
+                if move_right {
+                    drop(page);
+                    blk = next;
+                    pin = self.fetch(next)?;
+                    continue;
+                }
+                let pos = {
+                    let node = Node::open(&page[..])?;
+                    let pos = node.lower_bound(&entry)?;
+                    if pos < node.slot_count() && node.key_at(pos)? == entry.as_slice() {
+                        return Err(BTreeError::Duplicate);
+                    }
+                    pos
+                };
+                return self.insert_item(&pin, page, blk, pos, entry, &mut stack, None);
+            }
+        }
+    }
+
+    /// Removes the entry `key || tid`. Returns whether it existed.
+    /// Pages are never merged; empty pages are left for vacuum.
+    pub fn delete(&self, key: &[u8], tid: Tid) -> Result<bool> {
+        let entry = entry_key(key, tid)?;
+        let (mut pin, mut blk, _) = self.descend(&entry)?;
         loop {
-            let page = pin.write();
-            let node = Node::open(&page[..])?;
+            let mut page = pin.write();
+            let mut node = Node::open(&mut page[..])?;
             if node.must_move_right(&entry)? {
                 let next = node.opaque().next;
                 drop(page);
@@ -112,30 +202,13 @@ impl BTree {
             }
             let pos = node.lower_bound(&entry)?;
             if pos < node.slot_count() && node.key_at(pos)? == entry.as_slice() {
-                return Err(BTreeError::Duplicate);
-            }
-            return self.insert_item(&pin, page, blk, pos, entry, &mut stack);
-        }
-    }
-
-    /// Removes the entry `key || tid`. Returns whether it existed.
-    /// Pages are never merged; empty pages are left for vacuum.
-    pub fn delete(&self, key: &[u8], tid: Tid) -> Result<bool> {
-        let entry = entry_key(key, tid)?;
-        let (mut pin, _, _) = self.descend(&entry)?;
-        loop {
-            let mut page = pin.write();
-            let mut node = Node::open(&mut page[..])?;
-            if node.must_move_right(&entry)? {
-                let next = node.opaque().next;
-                drop(page);
-                pin = self.fetch(next)?;
-                continue;
-            }
-            let pos = node.lower_bound(&entry)?;
-            if pos < node.slot_count() && node.key_at(pos)? == entry.as_slice() {
                 node.remove_at(pos)?;
                 page.mark_dirty();
+                let mut b = BlockRef::new(self.rel, BlockNumber(blk));
+                b.data = pos.to_le_bytes().to_vec();
+                let mut rec = Record::new(RmgrId::Btree, info::DELETE);
+                rec.blocks.push(b);
+                self.log(rec, &mut [&mut page[..]]);
                 return Ok(true);
             }
             return Ok(false);
@@ -165,6 +238,10 @@ impl BTree {
         let pin = self.fetch(META_BLOCK)?;
         let page = pin.read();
         Meta::read(&page)
+    }
+
+    fn log(&self, rec: Record, pages: &mut [&mut [u8]]) {
+        log_and_stamp(self.pool.wal(), rec, pages);
     }
 
     /// Descends to the leaf that may contain `target`. Returns it pinned
@@ -218,8 +295,10 @@ impl BTree {
     }
 
     /// Inserts `item` at `pos` on the write-locked page `blk`, splitting and
-    /// recursing into the parent if needed. `pin` is the caller's pin of
-    /// that page and stays alive for the whole call.
+    /// recursing into the parent if needed. `_pin` is the caller's pin of
+    /// that page and stays alive for the whole call. `child` is the
+    /// locked page whose split this item (a downlink) completes.
+    #[allow(clippy::too_many_arguments)]
     fn insert_item(
         &self,
         _pin: &PinGuard<'_>,
@@ -228,45 +307,81 @@ impl BTree {
         pos: u16,
         item: Vec<u8>,
         stack: &mut Vec<u32>,
+        child: Option<(u32, &mut [u8])>,
     ) -> Result<()> {
         if Node::open(&mut page[..])?.insert_at(pos, &item)? {
             page.mark_dirty();
+            let mut b = BlockRef::new(self.rel, BlockNumber(blk));
+            b.data = pos.to_le_bytes().to_vec();
+            b.data.extend_from_slice(&item);
+            let mut rec = Record::new(RmgrId::Btree, info::INSERT);
+            rec.blocks.push(b);
+            match child {
+                Some((cblk, cpage)) => {
+                    clear_flags(cpage, flags::INCOMPLETE_SPLIT)?;
+                    rec.blocks.push(BlockRef::new(self.rel, BlockNumber(cblk)));
+                    self.log(rec, &mut [&mut page[..], cpage]);
+                }
+                None => self.log(rec, &mut [&mut page[..]]),
+            }
             return Ok(());
         }
 
         let (rblk, rpin) = self.pool.extend(self.rel)?;
         let mut rpage = rpin.write();
-        let (sep, op) = self.split(blk, &mut page, rblk.0, &mut rpage, pos, item)?;
-        page.mark_dirty();
-        rpage.mark_dirty();
+        let (sep, op) = self.split(blk, &mut page, rblk.0, &mut rpage, pos, item, child)?;
+        #[cfg(test)]
+        if self.stop_after_split.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         if op.is_root() {
             return self.new_root(blk, &mut page, rblk.0, &sep, op.level);
         }
+        self.insert_downlink(blk, &mut page, &sep, rblk.0, op.level, stack, Some(rpage))
+    }
 
-        // Lock the parent before releasing the children, so nobody can split
-        // the new right page and look for its (not yet inserted) downlink.
+    /// Inserts the downlink `sep -> rblk` into the parent of the locked
+    /// page `cblk` (at `level`), clearing its INCOMPLETE_SPLIT flag. The
+    /// parent is locked before `right` (the new right page) is released.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_downlink(
+        &self,
+        cblk: u32,
+        child: &mut PageMut<'_>,
+        sep: &[u8],
+        rblk: u32,
+        level: u32,
+        stack: &mut Vec<u32>,
+        right: Option<PageMut<'_>>,
+    ) -> Result<()> {
         let mut pblk = match stack.pop() {
             Some(b) => b,
-            None => self.leftmost_at(op.level + 1)?,
+            None => self.leftmost_at(level + 1)?,
         };
         let mut ppin = self.fetch(pblk)?;
         loop {
-            let ppage = ppin.write();
-            let found = {
+            let mut ppage = ppin.write();
+            let (slot, incomplete, next) = {
                 let pnode = Node::open(&ppage[..])?;
-                match pnode.find_downlink(blk)? {
-                    Some(slot) => Ok(slot),
-                    None => Err(pnode.opaque().next),
-                }
+                (
+                    pnode.find_downlink(cblk)?,
+                    pnode.opaque().flags & flags::INCOMPLETE_SPLIT != 0,
+                    pnode.opaque().next,
+                )
             };
-            match found {
-                Ok(slot) => {
-                    drop(rpage);
-                    drop(page);
-                    let downlink = internal_item(&sep, rblk.0);
-                    return self.insert_item(&ppin, ppage, pblk, slot + 1, downlink, stack);
+            // A parent-level page whose own split is unfinished gets its
+            // downlink first, before we insert into it or move past it.
+            if incomplete {
+                self.finish_split(pblk, &mut ppage, level + 1, stack.clone())?;
+            }
+            match slot {
+                Some(slot) => {
+                    drop(right);
+                    let downlink = internal_item(sep, rblk);
+                    let child = Some((cblk, &mut child[..]));
+                    return self.insert_item(&ppin, ppage, pblk, slot + 1, downlink, stack, child);
                 }
-                Err(next) => {
+                None => {
                     if next == P_NONE {
                         return Err(BTreeError::Corrupt("downlink to split page not found"));
                     }
@@ -278,9 +393,34 @@ impl BTree {
         }
     }
 
+    /// Completes the split of the locked page `blk` at `level` whose
+    /// downlink is missing (INCOMPLETE_SPLIT after a crash).
+    fn finish_split(
+        &self,
+        blk: u32,
+        page: &mut PageMut<'_>,
+        level: u32,
+        mut stack: Vec<u32>,
+    ) -> Result<()> {
+        let (sep, rblk, op) = {
+            let node = Node::open(&page[..])?;
+            let high = node
+                .high_key()?
+                .ok_or(BTreeError::Corrupt("incomplete split on a rightmost page"))?;
+            (high.to_vec(), node.opaque().next, node.opaque())
+        };
+        page.mark_dirty();
+        if op.is_root() {
+            return self.new_root(blk, page, rblk, &sep, level);
+        }
+        self.insert_downlink(blk, page, &sep, rblk, level, &mut stack, None)
+    }
+
     /// Splits the full page `lblk` (adding `item` at `pos`) into itself and
-    /// the new page `rblk`. Returns the separator (the right page's lower
-    /// bound and the left page's new high key) and the left page's opaque.
+    /// the new page `rblk`, and logs the split. Returns the separator (the
+    /// right page's lower bound and the left page's new high key) and the
+    /// left page's opaque.
+    #[allow(clippy::too_many_arguments)]
     fn split(
         &self,
         lblk: u32,
@@ -289,6 +429,7 @@ impl BTree {
         rpage: &mut PageMut<'_>,
         pos: u16,
         item: Vec<u8>,
+        child: Option<(u32, &mut [u8])>,
     ) -> Result<(Vec<u8>, Opaque)> {
         let (op, high, mut items, first) = {
             let n = Node::open(&lpage[..])?;
@@ -316,33 +457,74 @@ impl BTree {
             sep
         };
 
-        let left_op = Opaque { next: rblk, ..op };
+        let left_op = Opaque {
+            next: rblk,
+            flags: op.flags | flags::INCOMPLETE_SPLIT,
+            ..op
+        };
         let right_op = Opaque {
             prev: lblk,
             next: op.next,
             level: op.level,
-            flags: op.flags & !flags::ROOT,
+            flags: op.flags & !(flags::ROOT | flags::INCOMPLETE_SPLIT),
         };
         build_page(lpage, left_op, Some(&sep), &items)?;
         build_page(rpage, right_op, high.as_deref(), &right)?;
+        lpage.mark_dirty();
+        rpage.mark_dirty();
 
-        if op.next != P_NONE {
-            // Left-to-right lock order: left, new right, old right sibling.
-            let spin = self.fetch(op.next)?;
-            let mut spage = spin.write();
-            let mut snode = Node::open(&mut spage[..])?;
+        let mut rec = Record::new(RmgrId::Btree, info::SPLIT);
+        rec.blocks = vec![
+            image_block(self.rel, lblk, lpage),
+            image_block(self.rel, rblk, rpage),
+        ];
+        let mut split_flags = 0u8;
+
+        // Left-to-right lock order: left, new right, old right sibling.
+        let spin = if op.next != P_NONE {
+            Some(self.fetch(op.next)?)
+        } else {
+            None
+        };
+        let mut spage = spin.as_ref().map(|p| p.write());
+        if let Some(sp) = spage.as_mut() {
+            let mut snode = Node::open(&mut sp[..])?;
             let sop = Opaque {
                 prev: rblk,
                 ..snode.opaque()
             };
             snode.set_opaque(sop);
-            spage.mark_dirty();
+            sp.mark_dirty();
+            let mut b = BlockRef::new(self.rel, BlockNumber(op.next));
+            b.data = rblk.to_le_bytes().to_vec();
+            rec.blocks.push(b);
+            split_flags |= info::SPLIT_HAS_SIBLING;
         }
+        let child_page = match child {
+            Some((cblk, cpage)) => {
+                clear_flags(cpage, flags::INCOMPLETE_SPLIT)?;
+                rec.blocks.push(BlockRef::new(self.rel, BlockNumber(cblk)));
+                split_flags |= info::SPLIT_HAS_CHILD;
+                Some(cpage)
+            }
+            None => None,
+        };
+        rec.main = vec![split_flags];
+
+        let mut pages: Vec<&mut [u8]> = vec![&mut lpage[..], &mut rpage[..]];
+        if let Some(sp) = spage.as_mut() {
+            pages.push(&mut sp[..]);
+        }
+        if let Some(c) = child_page {
+            pages.push(c);
+        }
+        self.log(rec, &mut pages);
         Ok((sep, left_op))
     }
 
-    /// Creates a new root above the split old root and points the metapage
-    /// at it. Called with both halves still locked.
+    /// Creates a new root above the split old root, points the metapage at
+    /// it, and clears the old root's ROOT and INCOMPLETE_SPLIT flags, in one
+    /// WAL record. Called with the old root still locked.
     fn new_root(
         &self,
         lblk: u32,
@@ -352,37 +534,111 @@ impl BTree {
         level: u32,
     ) -> Result<()> {
         let (nblk, npin) = self.pool.extend(self.rel)?;
-        {
-            let mut np = npin.write();
-            let op = Opaque {
-                prev: P_NONE,
-                next: P_NONE,
-                level: level + 1,
-                flags: flags::ROOT,
-            };
-            let items = [internal_item(&[], lblk), internal_item(sep, rblk)];
-            build_page(&mut np, op, None, &items)?;
-            np.mark_dirty();
-        }
-        {
-            let mut lnode = Node::open(&mut lpage[..])?;
-            let op = Opaque {
-                flags: lnode.opaque().flags & !flags::ROOT,
-                ..lnode.opaque()
-            };
-            lnode.set_opaque(op);
-        }
+        let mut np = npin.write();
+        let op = Opaque {
+            prev: P_NONE,
+            next: P_NONE,
+            level: level + 1,
+            flags: flags::ROOT,
+        };
+        let items = [internal_item(&[], lblk), internal_item(sep, rblk)];
+        build_page(&mut np, op, None, &items)?;
+        np.mark_dirty();
+
+        clear_flags(lpage, flags::ROOT | flags::INCOMPLETE_SPLIT)?;
         lpage.mark_dirty();
 
         let mpin = self.fetch(META_BLOCK)?;
         let mut m = mpin.write();
-        Meta {
+        let meta = Meta {
             root: nblk.0,
             level: level + 1,
-        }
-        .write(&mut m)?;
+        };
+        meta.write(&mut m)?;
         m.mark_dirty();
+
+        let mut mb = BlockRef::new(self.rel, BlockNumber(META_BLOCK));
+        mb.data = [meta.root.to_le_bytes(), meta.level.to_le_bytes()].concat();
+        let mut rec = Record::new(RmgrId::Btree, info::NEWROOT);
+        rec.blocks = vec![
+            image_block(self.rel, nblk.0, &np),
+            BlockRef::new(self.rel, BlockNumber(lblk)),
+            mb,
+        ];
+        self.log(rec, &mut [&mut np[..], &mut lpage[..], &mut m[..]]);
         Ok(())
+    }
+}
+
+/// A block reference carrying a full image of `page` (a page built from
+/// scratch, so redo just restores it).
+fn image_block(rel: RelFileId, blk: u32, page: &[u8]) -> BlockRef {
+    let mut b = BlockRef::new(rel, BlockNumber(blk));
+    b.image = Some(page.to_vec());
+    b
+}
+
+/// Clears `bits` in a node page's flags.
+fn clear_flags(page: &mut [u8], bits: u16) -> Result<()> {
+    let mut node = Node::open(page)?;
+    let op = Opaque {
+        flags: node.opaque().flags & !bits,
+        ..node.opaque()
+    };
+    node.set_opaque(op);
+    Ok(())
+}
+
+/// Applies block `idx` of a B+Tree record that carries no image to `page`.
+/// The caller has checked that the page LSN is below the record's and sets
+/// the page LSN afterwards.
+pub fn redo(rec: &Record, idx: usize, page: &mut [u8]) -> Result<()> {
+    let block = rec
+        .blocks
+        .get(idx)
+        .ok_or(BTreeError::Corrupt("redo block index"))?;
+    let d = &block.data;
+    let slot = || -> Result<u16> {
+        d.get(..2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .ok_or(BTreeError::Corrupt("redo data too short"))
+    };
+    let u32_at = |at: usize| -> Result<u32> {
+        d.get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or(BTreeError::Corrupt("redo data too short"))
+    };
+    match (rec.info, idx) {
+        (info::INSERT, 0) => {
+            if !Node::open(page)?.insert_at(slot()?, &d[2..])? {
+                return Err(BTreeError::Corrupt("redo insert does not fit"));
+            }
+            Ok(())
+        }
+        (info::INSERT, 1) => clear_flags(page, flags::INCOMPLETE_SPLIT),
+        (info::DELETE, 0) => Node::open(page)?.remove_at(slot()?),
+        (info::SPLIT, i) if i >= 2 => {
+            let split_flags = rec.main.first().copied().unwrap_or(0);
+            let has_sibling = split_flags & info::SPLIT_HAS_SIBLING != 0;
+            if i == 2 && has_sibling {
+                let mut node = Node::open(page)?;
+                let op = Opaque {
+                    prev: u32_at(0)?,
+                    ..node.opaque()
+                };
+                node.set_opaque(op);
+                Ok(())
+            } else {
+                clear_flags(page, flags::INCOMPLETE_SPLIT)
+            }
+        }
+        (info::NEWROOT, 1) => clear_flags(page, flags::ROOT | flags::INCOMPLETE_SPLIT),
+        (info::NEWROOT, 2) => Meta {
+            root: u32_at(0)?,
+            level: u32_at(4)?,
+        }
+        .write(page),
+        _ => Err(BTreeError::Corrupt("record block needs an image")),
     }
 }
 
@@ -617,11 +873,15 @@ mod tests {
     fn check_invariants(tree: &BTree) -> Vec<Vec<u8>> {
         let meta = tree.meta().unwrap();
         let mut leaf_entries = Vec::new();
+        let mut expected_pages: Option<Vec<u32>> = None;
         for level in (0..=meta.level).rev() {
             let mut blk = tree.leftmost_at(level).unwrap();
             let mut prev = P_NONE;
             let mut lower: Option<Vec<u8>> = None;
+            let mut pages_here = Vec::new();
+            let mut children = Vec::new();
             loop {
+                pages_here.push(blk);
                 let pin = tree.fetch(blk).unwrap();
                 let page = pin.read();
                 let node = Node::open(&page[..]).unwrap();
@@ -631,6 +891,11 @@ mod tests {
                 assert_eq!(
                     op.is_root(),
                     level == meta.level && prev == P_NONE && op.is_rightmost()
+                );
+                assert_eq!(
+                    op.flags & flags::INCOMPLETE_SPLIT,
+                    0,
+                    "unfinished split at {blk}"
                 );
                 let high = node.high_key().unwrap().map(<[u8]>::to_vec);
                 let mut last: Option<Vec<u8>> = None;
@@ -655,6 +920,7 @@ mod tests {
                         leaf_entries.push(k);
                     } else {
                         let child = node.child_at(s).unwrap();
+                        children.push(child);
                         let cpin = tree.fetch(child).unwrap();
                         let cpage = cpin.read();
                         assert_eq!(Node::open(&cpage[..]).unwrap().opaque().level, level - 1);
@@ -666,6 +932,15 @@ mod tests {
                 }
                 prev = blk;
                 blk = op.next;
+            }
+            if let Some(exp) = expected_pages.take() {
+                assert_eq!(
+                    pages_here, exp,
+                    "every page at level {level} has a downlink"
+                );
+            }
+            if level > 0 {
+                expected_pages = Some(children);
             }
         }
         leaf_entries
@@ -958,6 +1233,156 @@ mod tests {
         assert!(tree.height().unwrap() as usize <= MAX_HEIGHT);
         assert_eq!(check_invariants(&tree).len(), expected.len());
         assert_eq!(all(&tree), expected.into_iter().collect::<Vec<_>>());
+    }
+
+    // ---- WAL ----
+
+    use crate::storage::backend::FixedFence;
+    use crate::storage::page::{Lsn, PAGE_SIZE, is_new_page, page_lsn, set_page_lsn};
+    use crate::wal::log::FIRST_LSN;
+    use crate::wal::{Wal, WalConfig, WalReader};
+    use std::collections::HashMap;
+
+    fn wal_cfg() -> WalConfig {
+        WalConfig {
+            timeline: 1,
+            segment_size: 256 * 1024,
+        }
+    }
+
+    fn setup_wal() -> (Arc<MemBackend>, Arc<BufferPool>, BTree) {
+        let mem = Arc::new(MemBackend::default());
+        let disk = Arc::new(DiskManager::new(mem.clone()));
+        disk.create_relation(REL, FENCE).unwrap();
+        let wal =
+            Arc::new(Wal::create(mem.clone(), Arc::new(FixedFence(FENCE)), wal_cfg()).unwrap());
+        let pool = Arc::new(
+            BufferPool::new(256, disk, Arc::new(SingleModeFlush::new(FENCE)))
+                .unwrap()
+                .with_wal(wal),
+        );
+        let tree = BTree::create(REL, pool.clone()).unwrap();
+        (mem, pool, tree)
+    }
+
+    fn replay(mem: &Arc<MemBackend>) -> HashMap<u32, Vec<u8>> {
+        let mut rd = WalReader::new(mem.clone(), wal_cfg(), FIRST_LSN, Some(Lsn::INVALID)).unwrap();
+        let mut pages: HashMap<u32, Vec<u8>> = HashMap::new();
+        while let Some((_, end, d)) = rd.next_record().unwrap() {
+            let rec = d.record;
+            for (i, b) in rec.blocks.iter().enumerate() {
+                let page = pages.entry(b.blk.0).or_insert_with(|| vec![0u8; PAGE_SIZE]);
+                if let Some(img) = &b.image {
+                    page.copy_from_slice(img);
+                } else if page_lsn(page) < end {
+                    redo(&rec, i, page).unwrap();
+                } else {
+                    continue;
+                }
+                set_page_lsn(page, end);
+            }
+        }
+        pages
+    }
+
+    #[test]
+    fn wal_replay_reproduces_tree() {
+        let (mem, pool, tree) = setup_wal();
+        let mut x: u64 = 777;
+        let mut inserted = Vec::new();
+        for i in 0..1500u32 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let e = (key((x % 50_000) as i64, 250), tid(i));
+            tree.insert(&e.0, e.1).unwrap();
+            inserted.push(e);
+        }
+        for e in inserted.iter().step_by(3) {
+            assert!(tree.delete(&e.0, e.1).unwrap());
+        }
+        assert!(tree.height().unwrap() >= 3);
+        check_invariants(&tree);
+        pool.wal().unwrap().flush_all();
+        let replayed = replay(&mem);
+        for blk in 0..pool.nblocks(REL).unwrap() {
+            let pin = tree.fetch(blk).unwrap();
+            let mut live = pin.read().to_vec();
+            live[8..12].fill(0);
+            let mut want = replayed
+                .get(&blk)
+                .cloned()
+                .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
+            want[8..12].fill(0);
+            assert_eq!(live, want, "block {blk} differs after replay");
+        }
+    }
+
+    /// First page (in block order) with INCOMPLETE_SPLIT set.
+    fn find_flagged(tree: &BTree) -> Option<u32> {
+        (1..tree.pool.nblocks(REL).unwrap()).find(|&blk| {
+            let pin = tree.fetch(blk).unwrap();
+            let page = pin.read();
+            !is_new_page(&page)
+                && Node::open(&page[..]).unwrap().opaque().flags & flags::INCOMPLETE_SPLIT != 0
+        })
+    }
+
+    #[test]
+    fn unfinished_split_is_completed_by_next_insert() {
+        let (_mem, _pool, tree) = setup_wal();
+        for i in 0..200 {
+            tree.insert(&key(i * 10, 300), tid(i as u32)).unwrap();
+        }
+        let before_height = tree.height().unwrap();
+        // "Crash" right after logging the next split.
+        tree.stop_after_split.store(true, Ordering::SeqCst);
+        let mut i = 0;
+        let flagged = loop {
+            tree.insert(&key(i * 10 + 5, 300), tid(10_000 + i as u32))
+                .unwrap();
+            if let Some(b) = find_flagged(&tree) {
+                break b;
+            }
+            i += 1;
+        };
+        tree.stop_after_split.store(false, Ordering::SeqCst);
+        // Searches still see everything through the right-link.
+        assert_eq!(all(&tree).len(), 200 + i as usize + 1);
+
+        // The next insert into that page finishes the split first.
+        let first_key = {
+            let pin = tree.fetch(flagged).unwrap();
+            let page = pin.read();
+            let node = Node::open(&page[..]).unwrap();
+            let e = node.key_at(node.first_data()).unwrap().to_vec();
+            e[..e.len() - TID_LEN].to_vec()
+        };
+        tree.insert(&first_key, tid(99_999)).unwrap();
+        assert!(find_flagged(&tree).is_none());
+        assert_eq!(check_invariants(&tree).len(), 200 + i as usize + 2);
+        assert_eq!(tree.height().unwrap(), before_height);
+    }
+
+    #[test]
+    fn unfinished_root_split_is_completed() {
+        let (_mem, _pool, tree) = setup_wal();
+        tree.stop_after_split.store(true, Ordering::SeqCst);
+        let mut n = 0;
+        while find_flagged(&tree).is_none() {
+            tree.insert(&key(n, 500), tid(n as u32)).unwrap();
+            n += 1;
+        }
+        tree.stop_after_split.store(false, Ordering::SeqCst);
+        assert_eq!(
+            tree.height().unwrap(),
+            1,
+            "metapage still points at the old root"
+        );
+        assert_eq!(all(&tree).len(), n as usize);
+        tree.insert(&key(0, 500), tid(50_000)).unwrap();
+        assert_eq!(tree.height().unwrap(), 2);
+        assert_eq!(check_invariants(&tree).len(), n as usize + 1);
     }
 
     fn in_range(k: &[u8], lo: &Bound<Vec<u8>>, hi: &Bound<Vec<u8>>) -> bool {

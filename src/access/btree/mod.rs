@@ -9,7 +9,7 @@ pub mod key;
 pub mod page;
 mod tree;
 
-pub use tree::{BTree, BTreeScan};
+pub use tree::{BTree, BTreeScan, info, redo};
 
 use crate::buffer::BufferError;
 use crate::storage::StorageError;

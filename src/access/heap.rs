@@ -27,10 +27,10 @@ use super::tuple::{self, MAX_TUPLE_SIZE, Tid, TupleError, TupleHeader};
 use crate::buffer::{BufferError, BufferPool, BufferTag, PageMut};
 use crate::storage::StorageError;
 use crate::storage::backend::RelFileId;
-use crate::storage::page::{BlockNumber, PageKind, is_new_page, set_page_lsn};
+use crate::storage::page::{BlockNumber, PageKind, is_new_page};
 use crate::storage::slotted::{SlotId, SlottedPage};
 use crate::txn::{CommandId, Xid};
-use crate::wal::fatal;
+use crate::wal::log_and_stamp;
 use crate::wal::record::{BlockRef, Record, RmgrId};
 
 /// Marker for "no target block yet".
@@ -262,21 +262,8 @@ impl HeapFile {
         self.log(rec, &mut [&mut page[..]]);
     }
 
-    /// Logs `rec` (one block per page, in order) and stamps the pages' LSN.
-    /// No-op without a WAL. Aborts on failure: the pages are already
-    /// modified (critical section).
     fn log(&self, rec: Record, pages: &mut [&mut [u8]]) {
-        let Some(wal) = self.pool.wal() else {
-            return;
-        };
-        let images: Vec<&[u8]> = pages.iter().map(|p| &**p).collect();
-        let end = match wal.insert_fpw(rec, &images) {
-            Ok((_, end)) => end,
-            Err(e) => fatal("heap WAL insert failed", &e),
-        };
-        for p in pages.iter_mut() {
-            set_page_lsn(p, end);
-        }
+        log_and_stamp(self.pool.wal(), rec, pages);
     }
 
     /// Moves the target block forward to `blk` (never backward).
@@ -807,7 +794,7 @@ mod tests {
 
     use crate::access::tuple::infomask;
     use crate::storage::backend::{FileKey, FixedFence};
-    use crate::storage::page::{Lsn, PAGE_SIZE, page_lsn};
+    use crate::storage::page::{Lsn, PAGE_SIZE, page_lsn, set_page_lsn};
     use crate::wal::log::{FIRST_LSN, xlog_info};
     use crate::wal::{Wal, WalConfig, WalReader};
     use std::collections::HashMap;
