@@ -52,6 +52,8 @@ pub mod info {
     pub const UPDATE: u8 = 2;
     /// Block 0: `old slot u16 | xmax u64 | cmax u32 | new slot u16 | tuple`.
     pub const UPDATE_SAME: u8 = 3;
+    /// Block 0: slots newly marked dead (u16 each); the page is compacted.
+    pub const PRUNE: u8 = 4;
 }
 
 /// Errors from heap operations.
@@ -373,6 +375,61 @@ impl HeapFile {
         }
     }
 
+    /// Number of blocks in the heap now.
+    pub fn nblocks(&self) -> Result<u32> {
+        Ok(self.pool.nblocks(self.rel)?)
+    }
+
+    /// Prunes block `blk`: tuples dead to everyone (by `horizon`) become
+    /// DEAD line pointers and the page is compacted; slot numbers stay, so
+    /// index entries still point at the dead slots until index vacuum.
+    /// Returns every DEAD slot on the page (including ones left by an
+    /// earlier, interrupted vacuum). Logged as one PRUNE record.
+    pub fn prune_page(
+        &self,
+        blk: BlockNumber,
+        horizon: Xid,
+        tm: &dyn TransactionManager,
+    ) -> Result<Vec<Tid>> {
+        let pin = self.pool.fetch(self.tag(blk))?;
+        let mut page = pin.write();
+        if is_new_page(&page) {
+            return Ok(Vec::new());
+        }
+        let mut newly_dead = Vec::new();
+        {
+            let p = SlottedPage::open(&page[..])?;
+            for s in 0..p.slot_count() {
+                let slot = SlotId(s);
+                if let Some(t) = p.get_item(slot)
+                    && satisfies_vacuum(&TupleHeader::decode(t)?, horizon, tm)? == VacuumState::Dead
+                {
+                    newly_dead.push(slot);
+                }
+            }
+        }
+        if !newly_dead.is_empty() {
+            let mut p = SlottedPage::open(&mut page[..])?;
+            for &slot in &newly_dead {
+                p.mark_dead(slot)?;
+            }
+            p.compact();
+            page.mark_dirty();
+            let mut b = BlockRef::new(self.rel, blk);
+            b.data = newly_dead.iter().flat_map(|s| s.0.to_le_bytes()).collect();
+            self.log1(Record::new(RmgrId::Heap, info::PRUNE), b, &mut page);
+        }
+        let p = SlottedPage::open(&page[..])?;
+        Ok((0..p.slot_count())
+            .map(SlotId)
+            .filter(|&s| {
+                p.item_id(s)
+                    .is_some_and(|id| id.state == crate::storage::slotted::ItemState::Dead)
+            })
+            .map(|slot| Tid { blk, slot })
+            .collect())
+    }
+
     /// Sequential scan returning only versions visible to `snap`, setting
     /// hint bits opportunistically page by page.
     pub fn scan_mvcc<'a>(
@@ -529,6 +586,53 @@ impl HeapFile {
     }
 }
 
+/// State of a tuple version for vacuum (PostgreSQL's HTSV_Result).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VacuumState {
+    /// Visible to someone and not deleted by a committed transaction.
+    Live,
+    /// Invisible to every current and future snapshot: removable.
+    Dead,
+    /// Deleted by a committed transaction some snapshot may predate.
+    RecentlyDead,
+    InsertInProgress,
+    DeleteInProgress,
+}
+
+/// Classifies a tuple version against the vacuum `horizon` (the oldest
+/// xmin any snapshot may hold; PostgreSQL's HeapTupleSatisfiesVacuum).
+pub fn satisfies_vacuum(
+    h: &TupleHeader,
+    horizon: Xid,
+    tm: &dyn TransactionManager,
+) -> Result<VacuumState> {
+    let mask = h.infomask;
+    if mask & infomask::XMIN_INVALID != 0 {
+        return Ok(VacuumState::Dead);
+    }
+    if mask & infomask::XMIN_COMMITTED == 0 {
+        match tm.status(h.xmin)? {
+            XidStatus::InProgress => return Ok(VacuumState::InsertInProgress),
+            XidStatus::Aborted => return Ok(VacuumState::Dead),
+            XidStatus::Committed => {}
+        }
+    }
+    if !h.xmax.is_valid() || mask & infomask::XMAX_INVALID != 0 {
+        return Ok(VacuumState::Live);
+    }
+    let status = if mask & infomask::XMAX_COMMITTED != 0 {
+        XidStatus::Committed
+    } else {
+        tm.status(h.xmax)?
+    };
+    Ok(match status {
+        XidStatus::InProgress => VacuumState::DeleteInProgress,
+        XidStatus::Aborted => VacuumState::Live,
+        XidStatus::Committed if h.xmax < horizon => VacuumState::Dead,
+        XidStatus::Committed => VacuumState::RecentlyDead,
+    })
+}
+
 /// Result of trying to delete or update a tuple (PostgreSQL's TM_Result).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TmResult {
@@ -657,6 +761,14 @@ pub fn redo(info: u8, idx: usize, block: &BlockRef, page: &mut [u8]) -> Result<(
             d.get(2..).ok_or(HeapError::Redo("short data"))?,
         ),
         (info::DELETE, 0) => redo_xmax(page, d, None),
+        (info::PRUNE, 0) => {
+            let mut p = SlottedPage::open(page)?;
+            for c in d.chunks_exact(2) {
+                p.mark_dead(SlotId(u16::from_le_bytes([c[0], c[1]])))?;
+            }
+            p.compact();
+            Ok(())
+        }
         (info::UPDATE, 0) => {
             let new = Tid {
                 blk: BlockNumber(u32_at(d, 14)?),
@@ -1645,6 +1757,105 @@ mod tests {
             assert!(advanced > held, "RC moves its xmin with each statement");
             rc.commit().unwrap();
             assert_eq!(tm.oldest_xmin(), tm.next_xid(), "nothing holds it back");
+        }
+
+        fn header_at(e: &Env, tid: Tid) -> TupleHeader {
+            TupleHeader::decode(&e.heap.fetch(tid).unwrap().unwrap()).unwrap()
+        }
+
+        #[test]
+        fn vacuum_classification() {
+            let e = env();
+            let tm = e.engine.txn().clone();
+            let live = committed_row(&e, 1);
+            let deleted = committed_row(&e, 2);
+            let recent = committed_row(&e, 3);
+            let mut ab = e.begin(Isolation::ReadCommitted);
+            let aborted = e.insert(&mut ab, 4);
+            ab.abort().unwrap();
+            let mut d = e.begin(Isolation::ReadCommitted);
+            e.heap.delete_mvcc(deleted, &mut d).unwrap();
+            d.commit().unwrap();
+            let mut holder = e.begin(Isolation::SnapshotIsolation);
+            holder.statement_snapshot(); // sees row 3 as live from here on
+            let mut d = e.begin(Isolation::ReadCommitted);
+            e.heap.delete_mvcc(recent, &mut d).unwrap();
+            d.commit().unwrap();
+            let mut running = e.begin(Isolation::ReadCommitted);
+            let ins = e.insert(&mut running, 5);
+            let mut del = e.begin(Isolation::ReadCommitted);
+            let pending = committed_row(&e, 6);
+            e.heap.delete_mvcc(pending, &mut del).unwrap();
+
+            let h = tm.oldest_xmin();
+            let st = |tid| satisfies_vacuum(&header_at(&e, tid), h, tm.as_ref()).unwrap();
+            assert_eq!(st(live), VacuumState::Live);
+            assert_eq!(st(deleted), VacuumState::Dead);
+            assert_eq!(st(recent), VacuumState::RecentlyDead);
+            assert_eq!(st(aborted), VacuumState::Dead);
+            assert_eq!(st(ins), VacuumState::InsertInProgress);
+            assert_eq!(st(pending), VacuumState::DeleteInProgress);
+            holder.commit().unwrap();
+            running.commit().unwrap();
+            del.commit().unwrap();
+            let h = tm.oldest_xmin();
+            let st = |tid| satisfies_vacuum(&header_at(&e, tid), h, tm.as_ref()).unwrap();
+            assert_eq!(
+                st(recent),
+                VacuumState::Dead,
+                "no snapshot holds it any more"
+            );
+        }
+
+        #[test]
+        fn prune_frees_space_and_survives_crash() {
+            let e = env();
+            let tm = e.engine.txn().clone();
+            let tids: Vec<Tid> = (0..40).map(|i| committed_row(&e, i)).collect();
+            let mut d = e.begin(Isolation::ReadCommitted);
+            for &t in tids.iter().step_by(2) {
+                e.heap.delete_mvcc(t, &mut d).unwrap();
+            }
+            d.commit().unwrap();
+            let blk = tids[0].blk;
+            let free = |e: &Env| {
+                let pin = e.engine.pool().fetch(BufferTag { rel: REL, blk }).unwrap();
+                let page = pin.read();
+                SlottedPage::open(&page[..]).unwrap().free_space()
+            };
+            let before = free(&e);
+            let dead = e
+                .heap
+                .prune_page(blk, tm.oldest_xmin(), tm.as_ref())
+                .unwrap();
+            assert_eq!(dead.len(), 20);
+            assert!(free(&e) > before);
+            assert!(dead.iter().all(|t| e.heap.fetch(*t).unwrap().is_none()));
+            let mut r = e.begin(Isolation::ReadCommitted);
+            let want: BTreeSet<i64> = (0..40).filter(|i| i % 2 == 1).collect();
+            assert_eq!(e.ids(&mut r), want);
+            drop(r);
+            // Pruning again finds the same DEAD slots and logs nothing new.
+            assert_eq!(
+                e.heap
+                    .prune_page(blk, tm.oldest_xmin(), tm.as_ref())
+                    .unwrap(),
+                dead
+            );
+
+            e.engine.wal().flush_all();
+            let mem = e.mem.clone();
+            drop(e);
+            let e = start(&mem);
+            let mut r = e.begin(Isolation::ReadCommitted);
+            assert_eq!(e.ids(&mut r), want);
+            let tm = e.engine.txn().clone();
+            assert_eq!(
+                e.heap
+                    .prune_page(blk, tm.oldest_xmin(), tm.as_ref())
+                    .unwrap(),
+                dead
+            );
         }
 
         #[test]
