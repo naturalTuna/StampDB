@@ -17,10 +17,17 @@ pub const SYS_CLASS_OID_INDEX: RelFileId = RelFileId(2662);
 pub const SYS_CLASS_RELNAME_INDEX: RelFileId = RelFileId(2663);
 pub const SYS_ATTRIBUTE_RELID_ATTNUM_INDEX: RelFileId = RelFileId(2659);
 pub const SYS_INDEX_INDRELID_INDEX: RelFileId = RelFileId(2679);
+pub const SYS_CONSTRAINT: RelFileId = RelFileId(2606);
+pub const SYS_CONSTRAINT_CONRELID_INDEX: RelFileId = RelFileId(2665);
 
 /// `relkind` values.
 pub const RELKIND_TABLE: &str = "r";
 pub const RELKIND_INDEX: &str = "i";
+
+/// `contype` values.
+pub const CONTYPE_PRIMARY: &str = "p";
+pub const CONTYPE_UNIQUE: &str = "u";
+pub const CONTYPE_CHECK: &str = "c";
 
 /// sys_class: oid, relname, relkind, relfilenode, relnatts.
 pub fn class_desc() -> TupleDesc {
@@ -35,7 +42,8 @@ pub fn class_desc() -> TupleDesc {
     }
 }
 
-/// sys_attribute: attrelid, attnum, attname, atttypid, atttypmod, attnotnull.
+/// sys_attribute: attrelid, attnum, attname, atttypid, atttypmod,
+/// attnotnull, attdefault (DEFAULT expression as SQL text, or NULL).
 pub fn attribute_desc() -> TupleDesc {
     TupleDesc {
         attrs: vec![
@@ -45,6 +53,24 @@ pub fn attribute_desc() -> TupleDesc {
             DataType::Int4,
             DataType::Int4,
             DataType::Bool,
+            DataType::Text,
+        ],
+    }
+}
+
+/// sys_constraint: oid, conname, contype, conrelid, conindid (0 for
+/// CHECK), conkey (column list as in indkey), consrc (CHECK expression as
+/// SQL text, or NULL).
+pub fn constraint_desc() -> TupleDesc {
+    TupleDesc {
+        attrs: vec![
+            DataType::Int8,
+            DataType::Text,
+            DataType::Text,
+            DataType::Int8,
+            DataType::Int8,
+            DataType::Text,
+            DataType::Text,
         ],
     }
 }
@@ -73,7 +99,7 @@ pub struct SysIndex {
     pub unique: bool,
 }
 
-pub const SYS_INDEXES: [SysIndex; 4] = [
+pub const SYS_INDEXES: [SysIndex; 5] = [
     SysIndex {
         rel: SYS_CLASS_OID_INDEX,
         name: "sys_class_oid_index",
@@ -102,13 +128,20 @@ pub const SYS_INDEXES: [SysIndex; 4] = [
         columns: &[2],
         unique: false,
     },
+    SysIndex {
+        rel: SYS_CONSTRAINT_CONRELID_INDEX,
+        name: "sys_constraint_conrelid_index",
+        table: SYS_CONSTRAINT,
+        columns: &[4],
+        unique: false,
+    },
 ];
 
 /// A system table: relation id, name, and (column name, type) pairs.
 pub type SysTable = (RelFileId, &'static str, Vec<(&'static str, DataType)>);
 
 /// The system tables with their column names and types.
-pub fn sys_tables() -> [SysTable; 3] {
+pub fn sys_tables() -> [SysTable; 4] {
     [
         (
             SYS_CLASS,
@@ -131,6 +164,7 @@ pub fn sys_tables() -> [SysTable; 3] {
                 ("atttypid", DataType::Int4),
                 ("atttypmod", DataType::Int4),
                 ("attnotnull", DataType::Bool),
+                ("attdefault", DataType::Text),
             ],
         ),
         (
@@ -142,6 +176,19 @@ pub fn sys_tables() -> [SysTable; 3] {
                 ("indkey", DataType::Text),
                 ("indisunique", DataType::Bool),
                 ("indisprimary", DataType::Bool),
+            ],
+        ),
+        (
+            SYS_CONSTRAINT,
+            "sys_constraint",
+            vec![
+                ("oid", DataType::Int8),
+                ("conname", DataType::Text),
+                ("contype", DataType::Text),
+                ("conrelid", DataType::Int8),
+                ("conindid", DataType::Int8),
+                ("conkey", DataType::Text),
+                ("consrc", DataType::Text),
             ],
         ),
     ]
@@ -191,6 +238,15 @@ pub fn int(v: &[Value], i: usize) -> Result<i64> {
         Some(Value::Int8(x)) => Ok(*x),
         Some(Value::Int4(x)) => Ok(i64::from(*x)),
         _ => Err(CatalogError::Corrupt("expected an integer column")),
+    }
+}
+
+/// Reads a nullable text column.
+pub fn opt_text(v: &[Value], i: usize) -> Result<Option<String>> {
+    match v.get(i) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::Text(s)) => Ok(Some(s.clone())),
+        _ => Err(CatalogError::Corrupt("expected a text column")),
     }
 }
 

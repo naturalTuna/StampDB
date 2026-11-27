@@ -63,6 +63,18 @@ pub enum CatalogError {
     #[error("column \"{0}\" does not exist")]
     UndefinedColumn(String),
 
+    #[error("constraint \"{name}\" for relation \"{table}\" already exists")]
+    DuplicateConstraint { name: String, table: String },
+
+    #[error("multiple primary keys for table \"{0}\" are not allowed")]
+    MultiplePrimaryKeys(String),
+
+    #[error("column \"{0}\" named in key does not exist")]
+    KeyColumnMissing(String),
+
+    #[error("cannot drop index {index} because constraint {index} on table {table} requires it")]
+    IndexRequiredByConstraint { index: String, table: String },
+
     #[error("corrupt catalog: {0}")]
     Corrupt(&'static str),
 }
@@ -83,6 +95,53 @@ pub struct Column {
     pub name: String,
     pub ty: DataType,
     pub not_null: bool,
+    /// DEFAULT expression as SQL text.
+    pub default: Option<String>,
+}
+
+impl Column {
+    /// A nullable column without default.
+    pub fn new(name: &str, ty: DataType) -> Self {
+        Self {
+            name: name.to_owned(),
+            ty,
+            not_null: false,
+            default: None,
+        }
+    }
+}
+
+/// Kind of a table constraint (sys_constraint.contype).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstraintKind {
+    /// Columns (by name) of the primary key.
+    PrimaryKey(Vec<String>),
+    /// Columns of a UNIQUE constraint.
+    Unique(Vec<String>),
+    /// CHECK expression as SQL text.
+    Check(String),
+}
+
+/// A constraint to create with a table (names already chosen).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewConstraint {
+    pub name: String,
+    pub kind: ConstraintKind,
+}
+
+/// A constraint as stored in sys_constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintInfo {
+    pub oid: u32,
+    pub name: String,
+    pub table: u32,
+    /// Index enforcing a PRIMARY KEY or UNIQUE constraint.
+    pub index: Option<u32>,
+    /// Constrained columns, 1-based (empty for CHECK).
+    pub columns: Vec<u16>,
+    pub primary: bool,
+    /// CHECK expression as SQL text.
+    pub check: Option<String>,
 }
 
 /// A relation as described by sys_class (and sys_attribute for tables).
@@ -145,7 +204,7 @@ pub fn initdb(
         for (i, (cname, ty)) in cols.iter().enumerate() {
             cat.insert_row(
                 SYS_ATTRIBUTE,
-                &attribute_row(rel.0, i + 1, cname, *ty, false),
+                &attribute_row(rel.0, i + 1, &Column::new(cname, *ty)),
                 xid,
                 cid,
             )?;
@@ -186,21 +245,33 @@ fn class_row(oid: u32, name: &str, kind: &str, rel: RelFileId, natts: usize) -> 
     ]
 }
 
-fn attribute_row(
-    relid: u32,
-    attnum: usize,
-    name: &str,
-    ty: DataType,
-    not_null: bool,
-) -> Vec<Value> {
-    let (typid, typmod) = type_to_oid(ty);
+fn attribute_row(relid: u32, attnum: usize, c: &Column) -> Vec<Value> {
+    let (typid, typmod) = type_to_oid(c.ty);
     vec![
         Value::Int8(i64::from(relid)),
         Value::Int4(attnum as i32),
-        Value::Text(name.to_owned()),
+        Value::Text(c.name.clone()),
         Value::Int4(typid),
         Value::Int4(typmod),
-        Value::Bool(not_null),
+        Value::Bool(c.not_null),
+        c.default.clone().map_or(Value::Null, Value::Text),
+    ]
+}
+
+fn constraint_row(oid: u32, c: &ConstraintInfo) -> Vec<Value> {
+    let contype = match (&c.check, c.primary) {
+        (Some(_), _) => CONTYPE_CHECK,
+        (None, true) => CONTYPE_PRIMARY,
+        (None, false) => CONTYPE_UNIQUE,
+    };
+    vec![
+        Value::Int8(i64::from(oid)),
+        Value::Text(c.name.clone()),
+        Value::Text(contype.to_owned()),
+        Value::Int8(i64::from(c.table)),
+        Value::Int8(i64::from(c.index.unwrap_or(0))),
+        Value::Text(format_indkey(&c.columns)),
+        c.check.clone().map_or(Value::Null, Value::Text),
     ]
 }
 
@@ -225,6 +296,7 @@ fn desc_of(table: RelFileId) -> Result<TupleDesc> {
         SYS_CLASS => class_desc(),
         SYS_ATTRIBUTE => attribute_desc(),
         SYS_INDEX => index_desc(),
+        SYS_CONSTRAINT => constraint_desc(),
         _ => return Err(CatalogError::Corrupt("not a system table")),
     })
 }
@@ -236,6 +308,7 @@ pub struct Catalog {
     class: HeapFile,
     attribute: HeapFile,
     index: HeapFile,
+    constraint: HeapFile,
     indexes: Vec<(SysIndex, BTree)>,
 }
 
@@ -249,7 +322,8 @@ impl Catalog {
         Ok(Self {
             class: HeapFile::open(SYS_CLASS, pool.clone())?,
             attribute: HeapFile::open(SYS_ATTRIBUTE, pool.clone())?,
-            index: HeapFile::open(SYS_INDEX, pool)?,
+            index: HeapFile::open(SYS_INDEX, pool.clone())?,
+            constraint: HeapFile::open(SYS_CONSTRAINT, pool)?,
             indexes,
             engine,
         })
@@ -264,6 +338,7 @@ impl Catalog {
             SYS_CLASS => &self.class,
             SYS_ATTRIBUTE => &self.attribute,
             SYS_INDEX => &self.index,
+            SYS_CONSTRAINT => &self.constraint,
             _ => return Err(CatalogError::Corrupt("not a system table")),
         })
     }
@@ -385,6 +460,56 @@ impl Catalog {
         name: &str,
         columns: &[Column],
     ) -> Result<RelationInfo> {
+        self.create_table_with(txn, name, columns, &[])
+    }
+
+    /// Creates table `name` with `constraints`: PRIMARY KEY and UNIQUE get
+    /// their unique index (named like the constraint), PRIMARY KEY columns
+    /// become NOT NULL, CHECK expressions are stored as given.
+    pub fn create_table_with(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        columns: &[Column],
+        constraints: &[NewConstraint],
+    ) -> Result<RelationInfo> {
+        let mut columns = columns.to_vec();
+        let attnums = |cols: &[String], columns: &[Column]| -> Result<Vec<u16>> {
+            cols.iter()
+                .map(|c| {
+                    columns
+                        .iter()
+                        .position(|col| col.name == *c)
+                        .map(|i| (i + 1) as u16)
+                        .ok_or_else(|| CatalogError::KeyColumnMissing(c.clone()))
+                })
+                .collect()
+        };
+        let mut primary = false;
+        for (i, c) in constraints.iter().enumerate() {
+            if constraints[..i].iter().any(|d| d.name == c.name) {
+                return Err(CatalogError::DuplicateConstraint {
+                    name: c.name.clone(),
+                    table: name.to_owned(),
+                });
+            }
+            match &c.kind {
+                ConstraintKind::PrimaryKey(cols) => {
+                    if primary {
+                        return Err(CatalogError::MultiplePrimaryKeys(name.to_owned()));
+                    }
+                    primary = true;
+                    for a in attnums(cols, &columns)? {
+                        columns[usize::from(a) - 1].not_null = true;
+                    }
+                }
+                ConstraintKind::Unique(cols) => {
+                    attnums(cols, &columns)?;
+                }
+                ConstraintKind::Check(_) => {}
+            }
+        }
+        let columns = &columns[..];
         txn.write_xid()?;
         let oid = self.engine.allocate_oid()?;
         let rel = RelFileId(oid);
@@ -395,24 +520,87 @@ impl Catalog {
             name,
         )?;
         for (i, c) in columns.iter().enumerate() {
-            self.insert_row_checked(
-                txn,
-                SYS_ATTRIBUTE,
-                &attribute_row(oid, i + 1, &c.name, c.ty, c.not_null),
-                name,
-            )?;
+            self.insert_row_checked(txn, SYS_ATTRIBUTE, &attribute_row(oid, i + 1, c), name)?;
         }
         self.engine.create_relation(rel)?;
         txn.drop_on_abort(rel);
         txn.lock_relation(rel, LockMode::AccessExclusive)?;
         txn.next_command();
-        Ok(RelationInfo {
+        let info = RelationInfo {
             oid,
             name: name.to_owned(),
             kind: RelKind::Table,
             rel,
             columns: columns.to_vec(),
-        })
+        };
+        for c in constraints {
+            let mut con = ConstraintInfo {
+                oid: 0,
+                name: c.name.clone(),
+                table: oid,
+                index: None,
+                columns: Vec::new(),
+                primary: false,
+                check: None,
+            };
+            match &c.kind {
+                ConstraintKind::PrimaryKey(cols) | ConstraintKind::Unique(cols) => {
+                    con.columns = attnums(cols, columns)?;
+                    con.primary = matches!(c.kind, ConstraintKind::PrimaryKey(_));
+                    let idx = self.build_index(
+                        txn,
+                        &c.name,
+                        &info,
+                        con.columns.clone(),
+                        true,
+                        con.primary,
+                    )?;
+                    con.index = Some(idx.oid);
+                }
+                ConstraintKind::Check(expr) => con.check = Some(expr.clone()),
+            }
+            let coid = self.engine.allocate_oid()?;
+            self.insert_row_checked(txn, SYS_CONSTRAINT, &constraint_row(coid, &con), &c.name)?;
+        }
+        txn.next_command();
+        Ok(info)
+    }
+
+    /// Constraints of the table with OID `table`, by OID.
+    pub fn constraints_of(&self, txn: &mut Transaction, table: u32) -> Result<Vec<ConstraintInfo>> {
+        let rows = self.lookup(
+            txn,
+            SYS_CONSTRAINT_CONRELID_INDEX,
+            &[DataType::Int8],
+            &[Value::Int8(i64::from(table))],
+        )?;
+        let mut out = Vec::new();
+        for (_, r) in rows {
+            let index = int(&r, 4)? as u32;
+            out.push(ConstraintInfo {
+                oid: int(&r, 0)? as u32,
+                name: text(&r, 1)?,
+                table: int(&r, 3)? as u32,
+                index: (index != 0).then_some(index),
+                columns: parse_indkey(&text(&r, 5)?)?,
+                primary: text(&r, 2)? == CONTYPE_PRIMARY,
+                check: opt_text(&r, 6)?,
+            });
+        }
+        out.sort_by_key(|c| c.oid);
+        Ok(out)
+    }
+
+    /// A free relation name: `base`, else `base1`, `base2`, ...
+    /// (PostgreSQL's ChooseRelationName).
+    pub fn choose_relation_name(&self, txn: &mut Transaction, base: &str) -> Result<String> {
+        let mut n = base.to_owned();
+        let mut k = 0;
+        while self.lookup_relation(txn, &n)?.is_some() {
+            k += 1;
+            n = format!("{base}{k}");
+        }
+        Ok(n)
     }
 
     /// Drops table `name` and its indexes within `txn` (files are deleted
@@ -432,6 +620,14 @@ impl Catalog {
         for idx in self.indexes_of(txn, info.oid)? {
             self.drop_index_rows(txn, idx.oid)?;
             txn.drop_on_commit(idx.rel);
+        }
+        for (tid, _) in self.lookup(
+            txn,
+            SYS_CONSTRAINT_CONRELID_INDEX,
+            &[DataType::Int8],
+            &[Value::Int8(i64::from(info.oid))],
+        )? {
+            self.delete_row(txn, SYS_CONSTRAINT, tid)?;
         }
         let oid = Value::Int8(i64::from(info.oid));
         for (tid, _) in self.lookup(
@@ -482,6 +678,19 @@ impl Catalog {
             })
             .collect::<Result<Vec<u16>>>()?;
 
+        self.build_index(txn, name, &t, attnums, unique, false)
+    }
+
+    /// Creates and fills index `name` on locked table `t`.
+    fn build_index(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        t: &RelationInfo,
+        attnums: Vec<u16>,
+        unique: bool,
+        primary: bool,
+    ) -> Result<IndexInfo> {
         txn.write_xid()?;
         let oid = self.engine.allocate_oid()?;
         let rel = RelFileId(oid);
@@ -494,7 +703,7 @@ impl Catalog {
         self.insert_row_checked(
             txn,
             SYS_INDEX,
-            &index_row(oid, t.oid, &attnums, unique, false),
+            &index_row(oid, t.oid, &attnums, unique, primary),
             name,
         )?;
         self.engine.create_relation(rel)?;
@@ -507,7 +716,7 @@ impl Catalog {
             table: t.oid,
             columns: attnums,
             unique,
-            primary: false,
+            primary,
         };
 
         // Index every version some snapshot may still see.
@@ -524,7 +733,7 @@ impl Catalog {
                     continue;
                 }
                 let row = deform_tuple(&desc, &tuple)?;
-                self.insert_entry(txn, &t, &info, &tree, &heap, &row, tid)?;
+                self.insert_entry(txn, t, &info, &tree, &heap, &row, tid)?;
             }
         }
         txn.next_command();
@@ -541,6 +750,19 @@ impl Catalog {
             .index_table(txn, idx.oid)?
             .ok_or(CatalogError::Corrupt("index without sys_index row"))?;
         txn.lock_relation(RelFileId(table), LockMode::AccessExclusive)?;
+        if self
+            .constraints_of(txn, table)?
+            .iter()
+            .any(|c| c.index == Some(idx.oid))
+        {
+            let table = self
+                .lookup_oid(txn, table)?
+                .map_or_else(String::new, |t| t.name);
+            return Err(CatalogError::IndexRequiredByConstraint {
+                index: name.to_owned(),
+                table,
+            });
+        }
         self.drop_index_rows(txn, idx.oid)?;
         txn.drop_on_commit(idx.rel);
         txn.next_command();
@@ -706,6 +928,7 @@ impl Catalog {
             (SYS_CLASS, &self.class),
             (SYS_ATTRIBUTE, &self.attribute),
             (SYS_INDEX, &self.index),
+            (SYS_CONSTRAINT, &self.constraint),
         ] {
             let trees: Vec<&BTree> = self
                 .indexes
@@ -777,6 +1000,7 @@ impl Catalog {
                     name: text(&a, 2)?,
                     ty: oid_to_type(int(&a, 3)? as i32, int(&a, 4)? as i32)?,
                     not_null: boolean(&a, 5)?,
+                    default: opt_text(&a, 6)?,
                 });
             }
         }

@@ -25,6 +25,11 @@ pub mod code {
     pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
     pub const NOT_NULL_VIOLATION: &str = "23502";
     pub const UNIQUE_VIOLATION: &str = "23505";
+    pub const CHECK_VIOLATION: &str = "23514";
+    pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
+    pub const DUPLICATE_OBJECT: &str = "42710";
+    pub const INVALID_TABLE_DEFINITION: &str = "42P16";
+    pub const INVALID_OBJECT_DEFINITION: &str = "42P17";
     pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
     pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
     pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
@@ -183,6 +188,12 @@ impl From<CatalogError> for SqlError {
             CatalogError::UndefinedRelation(_) => Self::new(code::UNDEFINED_TABLE, msg),
             CatalogError::UniqueViolation(_) => Self::new(code::UNIQUE_VIOLATION, msg),
             CatalogError::UndefinedColumn(_) => Self::new(code::UNDEFINED_COLUMN, msg),
+            CatalogError::DuplicateConstraint { .. } => Self::new(code::DUPLICATE_OBJECT, msg),
+            CatalogError::MultiplePrimaryKeys(_) => Self::new(code::INVALID_TABLE_DEFINITION, msg),
+            CatalogError::KeyColumnMissing(_) => Self::new(code::UNDEFINED_COLUMN, msg),
+            CatalogError::IndexRequiredByConstraint { .. } => {
+                Self::new(code::DEPENDENT_OBJECTS_STILL_EXIST, msg)
+            }
             CatalogError::Recovery(_) | CatalogError::Corrupt(_) => Self::internal(msg),
         }
     }

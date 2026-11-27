@@ -115,11 +115,13 @@ fn cols() -> Vec<Column> {
             name: "id".into(),
             ty: DataType::Int4,
             not_null: true,
+            default: None,
         },
         Column {
             name: "name".into(),
             ty: DataType::Varchar(Some(10)),
             not_null: false,
+            default: None,
         },
     ]
 }
@@ -303,11 +305,13 @@ fn people() -> Vec<Column> {
             name: "id".into(),
             ty: DataType::Int4,
             not_null: true,
+            default: None,
         },
         Column {
             name: "email".into(),
             ty: DataType::Text,
             not_null: false,
+            default: None,
         },
     ]
 }
@@ -492,4 +496,85 @@ fn create_index_waits_for_writers() {
         h.join().unwrap()
     });
     assert_eq!(index_entries(&e, &idx), 1, "the committed row is indexed");
+}
+
+#[test]
+fn constraints_are_stored_and_enforced_by_indexes() {
+    let e = fresh();
+    let mut t = e.begin();
+    let mut cols = vec![
+        Column::new("id", DataType::Int4),
+        Column::new("code", DataType::Text),
+        Column::new("qty", DataType::Int4),
+    ];
+    cols[2].default = Some("1 + 1".to_owned());
+    let cons = [
+        NewConstraint {
+            name: "t_pkey".into(),
+            kind: ConstraintKind::PrimaryKey(vec!["id".into()]),
+        },
+        NewConstraint {
+            name: "t_code_key".into(),
+            kind: ConstraintKind::Unique(vec!["code".into(), "qty".into()]),
+        },
+        NewConstraint {
+            name: "t_qty_check".into(),
+            kind: ConstraintKind::Check("qty > 0".into()),
+        },
+    ];
+    let info = e.cat.create_table_with(&mut t, "t", &cols, &cons).unwrap();
+    assert!(info.columns[0].not_null, "primary key columns are NOT NULL");
+    t.commit().unwrap();
+
+    let mut t = e.begin();
+    let info = e.cat.lookup_relation(&mut t, "t").unwrap().unwrap();
+    assert!(info.columns[0].not_null);
+    assert_eq!(info.columns[2].default.as_deref(), Some("1 + 1"));
+    let cs = e.cat.constraints_of(&mut t, info.oid).unwrap();
+    let idx = e.cat.indexes_of(&mut t, info.oid).unwrap();
+    assert_eq!(cs.len(), 3);
+    assert_eq!(idx.len(), 2);
+    assert!(cs[0].primary && cs[0].index == Some(idx[0].oid) && cs[0].columns == [1]);
+    assert!(idx[0].primary && idx[0].unique && idx[0].name == "t_pkey");
+    assert_eq!((cs[1].columns.clone(), cs[1].primary), (vec![2, 3], false));
+    assert_eq!(cs[2].check.as_deref(), Some("qty > 0"));
+    assert!(matches!(
+        e.cat.drop_index(&mut t, "t_pkey"),
+        Err(CatalogError::IndexRequiredByConstraint { .. })
+    ));
+    drop(t);
+
+    // Definition errors.
+    let mut t = e.begin();
+    let pk = |c: &str| NewConstraint {
+        name: format!("{c}_pk"),
+        kind: ConstraintKind::PrimaryKey(vec![c.into()]),
+    };
+    assert!(matches!(
+        e.cat
+            .create_table_with(&mut t, "u", &cols, &[pk("id"), pk("code")]),
+        Err(CatalogError::MultiplePrimaryKeys(_))
+    ));
+    assert!(matches!(
+        e.cat.create_table_with(&mut t, "u", &cols, &[pk("nope")]),
+        Err(CatalogError::KeyColumnMissing(_))
+    ));
+    assert!(matches!(
+        e.cat
+            .create_table_with(&mut t, "u", &cols, &[pk("id"), pk("id")]),
+        Err(CatalogError::DuplicateConstraint { .. })
+    ));
+    drop(t);
+
+    // Dropping the table removes its constraints.
+    let mut t = e.begin();
+    e.cat.drop_table(&mut t, "t").unwrap();
+    assert!(e.cat.constraints_of(&mut t, info.oid).unwrap().is_empty());
+    t.commit().unwrap();
+    assert_eq!(
+        e.cat
+            .choose_relation_name(&mut e.begin(), "t_pkey")
+            .unwrap(),
+        "t_pkey"
+    );
 }

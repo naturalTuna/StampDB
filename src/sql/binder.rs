@@ -242,6 +242,7 @@ fn column_def(c: &ast::ColumnDef) -> Result<Column> {
         name: ident(&c.name),
         ty: data_type(&c.data_type)?,
         not_null: false,
+        default: None,
     })
 }
 

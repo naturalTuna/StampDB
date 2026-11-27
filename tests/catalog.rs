@@ -76,6 +76,7 @@ fn cols(n: usize) -> Vec<Column> {
                 DataType::Text
             },
             not_null: i == 0,
+            default: None,
         })
         .collect()
 }
