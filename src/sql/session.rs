@@ -13,12 +13,13 @@ use sqlparser::parser::Parser;
 use super::binder::{Binder, Bound, Kind, Utility, classify};
 use super::error::{Result, SqlError, code};
 use super::exec::{self, ExecEnv};
-use super::plan::OutCol;
+use super::expr::{Expr, is_true};
+use super::plan::{OutCol, Plan};
 use super::planner;
-use crate::access::heap::HeapFile;
-use crate::access::tuple::form_tuple;
+use crate::access::heap::{HeapFile, TmResult};
+use crate::access::tuple::{deform_tuple, form_tuple};
 use crate::access::visibility::Me;
-use crate::catalog::{Catalog, RelKind};
+use crate::catalog::{Catalog, RelKind, RelationInfo};
 use crate::lock::{LockManager, WaitPolicy};
 use crate::txn::{Isolation, Transaction, TransactionManager};
 use crate::types::Value;
@@ -96,7 +97,9 @@ impl QueryResult {
 enum State {
     Idle,
     Block(Transaction),
-    Failed(Transaction),
+    /// A block whose transaction failed (and was already aborted, which
+    /// released its locks); waits for COMMIT or ROLLBACK.
+    Failed,
 }
 
 /// One client's session.
@@ -119,7 +122,7 @@ impl Session {
         match self.state {
             State::Idle => 'I',
             State::Block(_) => 'T',
-            State::Failed(_) => 'E',
+            State::Failed => 'E',
         }
     }
 
@@ -128,7 +131,7 @@ impl Session {
         let stmts = match parse(sql) {
             Ok(s) => s,
             Err(e) => {
-                self.fail();
+                self.fail()?;
                 return Err(e);
             }
         };
@@ -140,18 +143,17 @@ impl Session {
         let kind = match classify(stmt) {
             Ok(k) => k,
             Err(e) => {
-                self.fail();
+                self.fail()?;
                 return Err(e);
             }
         };
         let state = std::mem::replace(&mut self.state, State::Idle);
         match (state, kind) {
-            (State::Failed(t), Kind::Utility(Utility::Commit | Utility::Rollback)) => {
-                t.abort()?;
+            (State::Failed, Kind::Utility(Utility::Commit | Utility::Rollback)) => {
                 Ok(QueryResult::tag("ROLLBACK"))
             }
-            (State::Failed(t), _) => {
-                self.state = State::Failed(t);
+            (State::Failed, _) => {
+                self.state = State::Failed;
                 Err(SqlError::new(
                     code::IN_FAILED_SQL_TRANSACTION,
                     "current transaction is aborted, commands ignored until end of transaction block",
@@ -185,7 +187,7 @@ impl Session {
                 if ok {
                     Ok(QueryResult::tag("SET"))
                 } else {
-                    self.fail();
+                    self.fail()?;
                     Err(SqlError::new(
                         code::ACTIVE_SQL_TRANSACTION,
                         "SET TRANSACTION ISOLATION LEVEL must be called before any query",
@@ -197,10 +199,13 @@ impl Session {
             (State::Block(mut t), kind) => {
                 let r = self.run_in(&mut t, &kind);
                 t.next_command();
-                self.state = match r {
-                    Ok(_) => State::Block(t),
-                    Err(_) => State::Failed(t),
-                };
+                match &r {
+                    Ok(_) => self.state = State::Block(t),
+                    Err(_) => {
+                        t.abort()?;
+                        self.state = State::Failed;
+                    }
+                }
                 r
             }
             (State::Idle, kind) => {
@@ -219,11 +224,16 @@ impl Session {
         }
     }
 
-    /// Moves an open block to the failed state.
-    fn fail(&mut self) {
-        if let State::Block(t) = std::mem::replace(&mut self.state, State::Idle) {
-            self.state = State::Failed(t);
+    /// Aborts an open block's transaction, leaving the block failed.
+    fn fail(&mut self) -> Result<()> {
+        match std::mem::replace(&mut self.state, State::Idle) {
+            State::Block(t) => {
+                self.state = State::Failed;
+                t.abort()?;
+            }
+            other => self.state = other,
         }
+        Ok(())
     }
 
     fn run_in(&self, txn: &mut Transaction, kind: &Kind<'_>) -> Result<QueryResult> {
@@ -399,10 +409,106 @@ impl Session {
                 }
                 Ok(QueryResult::tag(format!("INSERT 0 {}", rows.len())))
             }
-            Bound::Update { .. } | Bound::Delete { .. } => {
-                Err(SqlError::unsupported("UPDATE and DELETE"))
+            Bound::Update {
+                table,
+                scan,
+                assignments,
+            } => {
+                let n = self.modify(txn, &table, scan, Some(&assignments))?;
+                Ok(QueryResult::tag(format!("UPDATE {n}")))
+            }
+            Bound::Delete { table, scan } => {
+                let n = self.modify(txn, &table, scan, None)?;
+                Ok(QueryResult::tag(format!("DELETE {n}")))
             }
         }
+    }
+
+    /// UPDATE (with `assignments`) or DELETE of the rows `scan` finds.
+    ///
+    /// A row changed by a concurrent transaction is waited for; under Read
+    /// Committed, if that transaction committed an update, the newest
+    /// version is fetched and the WHERE clause re-evaluated on it before
+    /// retrying (EvalPlanQual). Under Snapshot Isolation the heap returns a
+    /// serialization failure instead.
+    fn modify(
+        &self,
+        txn: &mut Transaction,
+        table: &RelationInfo,
+        scan: Plan,
+        assignments: Option<&[(usize, Expr)]>,
+    ) -> Result<u64> {
+        let plan = planner::optimize(scan)?;
+        let filter = match &plan {
+            Plan::Scan { filter, .. } | Plan::IndexScan { filter, .. } => filter.clone(),
+            _ => return Err(SqlError::internal("DML plan is not a scan")),
+        };
+        let env = self.env(txn);
+        let mut rows = exec::table_scan(&plan, &env)?;
+        let cat = &self.db.catalog;
+        let heap = HeapFile::open(table.rel, self.db.engine().pool().clone())?;
+        let indexes = match assignments {
+            Some(_) => cat.table_indexes(txn, table)?,
+            None => Vec::new(),
+        };
+        let desc = table.desc();
+        let mut count = 0;
+        while let Some((first_tid, first_row)) = rows.next_with_tid()? {
+            let (mut tid, mut row) = (first_tid, first_row);
+            loop {
+                let result = match assignments {
+                    Some(set) => {
+                        let mut new_row = row.clone();
+                        for (col, e) in set {
+                            new_row[*col] = e.eval(&row)?;
+                        }
+                        let xid = txn.write_xid()?;
+                        let t = form_tuple(&desc, &new_row, xid, txn.command_id())?;
+                        let r = heap.update_waiting(tid, &t, txn)?;
+                        if let TmResult::Ok(new_tid) = r {
+                            for (idx, tree) in &indexes {
+                                cat.insert_entry(txn, table, idx, tree, &heap, &new_row, new_tid)?;
+                            }
+                        }
+                        r
+                    }
+                    None => heap.delete_waiting(tid, txn)?,
+                };
+                match result {
+                    TmResult::Ok(_) => {
+                        count += 1;
+                        break;
+                    }
+                    TmResult::Updated { ctid, .. } => {
+                        // EvalPlanQual: recheck the newest version.
+                        let Some(latest) = heap.latest_version(ctid, txn.tm())? else {
+                            break; // deleted meanwhile
+                        };
+                        let Some(t) = heap.fetch(latest)? else {
+                            break;
+                        };
+                        let r = deform_tuple(&desc, &t)?;
+                        let passes = match &filter {
+                            Some(f) => is_true(&f.eval(&r)?),
+                            None => true,
+                        };
+                        if !passes {
+                            break;
+                        }
+                        (tid, row) = (latest, r);
+                    }
+                    // Deleted by a committed transaction, or already
+                    // changed by this statement: skip it (PostgreSQL does).
+                    TmResult::Deleted { .. } | TmResult::SelfModified | TmResult::Invisible => {
+                        break;
+                    }
+                    TmResult::BeingModified(_) => {
+                        return Err(SqlError::internal("row still being modified after waiting"));
+                    }
+                }
+            }
+        }
+        Ok(count)
     }
 }
 

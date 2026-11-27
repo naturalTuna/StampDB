@@ -487,3 +487,187 @@ fn ddl_statements() {
     assert_eq!(fails(&mut s, "DROP TABLE t").code, code::UNDEFINED_TABLE);
     ok(&mut s, "DROP TABLE IF EXISTS t, t");
 }
+
+#[test]
+fn update_and_delete() {
+    let db = db();
+    let mut s = db.session();
+    ok(&mut s, "CREATE TABLE t (id INT, n INT, s TEXT)");
+    ok(&mut s, "CREATE UNIQUE INDEX t_id ON t (id)");
+    ok(
+        &mut s,
+        "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')",
+    );
+    assert_eq!(
+        ok(&mut s, "UPDATE t SET n = n + 1 WHERE id >= 2"),
+        "UPDATE 2"
+    );
+    assert_eq!(ok(&mut s, "UPDATE t SET n = n * 2"), "UPDATE 3");
+    assert_eq!(
+        q(&mut s, "SELECT id, n FROM t ORDER BY id"),
+        rows(&[&["1", "20"], &["2", "42"], &["3", "62"]])
+    );
+    // Assignments see the old row; the unique index sees the new keys.
+    assert_eq!(
+        ok(&mut s, "UPDATE t AS x SET id = x.id + 10, s = upper(s)"),
+        "UPDATE 3"
+    );
+    assert_eq!(
+        q(&mut s, "SELECT id, s FROM t ORDER BY id"),
+        rows(&[&["11", "A"], &["12", "B"], &["13", "C"]])
+    );
+    assert_eq!(
+        fails(&mut s, "UPDATE t SET id = 11").code,
+        code::UNIQUE_VIOLATION
+    );
+    assert_eq!(ok(&mut s, "DELETE FROM t WHERE n > 50"), "DELETE 1");
+    assert_eq!(
+        ok(&mut s, "INSERT INTO t VALUES (13, 0, 'again')"),
+        "INSERT 0 1"
+    );
+    assert_eq!(ok(&mut s, "DELETE FROM t WHERE s IS NULL"), "DELETE 0");
+    assert_eq!(
+        fails(&mut s, "UPDATE t SET nope = 1").code,
+        code::UNDEFINED_COLUMN
+    );
+    assert_eq!(
+        fails(&mut s, "UPDATE t SET n = 'x'").code,
+        code::INVALID_TEXT_REPRESENTATION
+    );
+    assert_eq!(
+        fails(&mut s, "UPDATE t SET n = 1, n = 2").code,
+        code::SYNTAX_ERROR
+    );
+    assert_eq!(ok(&mut s, "DELETE FROM t"), "DELETE 3");
+    assert_eq!(q(&mut s, "SELECT count(*) FROM t"), rows(&[&["0"]]));
+
+    // Changes inside a block are visible to later statements only.
+    ok(&mut s, "INSERT INTO t VALUES (1, 1, 'x')");
+    ok(&mut s, "BEGIN");
+    ok(&mut s, "UPDATE t SET n = n + 1");
+    ok(&mut s, "UPDATE t SET n = n + 1");
+    assert_eq!(q(&mut s, "SELECT n FROM t"), rows(&[&["3"]]));
+    ok(&mut s, "ROLLBACK");
+    assert_eq!(q(&mut s, "SELECT n FROM t"), rows(&[&["1"]]));
+}
+
+/// Runs `sql` in `s` on another thread once `s` is blocked behind a lock
+/// held by the caller, returning the outcome after `release` runs.
+fn blocked<T: Send>(
+    s: &mut Session,
+    sql: &str,
+    release: impl FnOnce() -> T,
+) -> (T, Result<Vec<QueryResult>>) {
+    std::thread::scope(|sc| {
+        let h = sc.spawn(|| s.execute(sql));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!h.is_finished(), "{sql} should wait");
+        let t = release();
+        (t, h.join().unwrap())
+    })
+}
+
+#[test]
+fn read_committed_rechecks_concurrent_updates() {
+    let db = db();
+    let mut a = db.session();
+    let mut b = db.session();
+    ok(&mut a, "CREATE TABLE acct (id INT, bal INT)");
+    ok(&mut a, "INSERT INTO acct VALUES (1, 100), (2, 100)");
+
+    // Both increment: the second applies to the first one's result.
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "UPDATE acct SET bal = bal + 10 WHERE id = 1");
+    let (_, r) = blocked(&mut b, "UPDATE acct SET bal = bal * 2 WHERE id = 1", || {
+        ok(&mut a, "COMMIT")
+    });
+    assert_eq!(r.unwrap()[0].tag, "UPDATE 1");
+    assert_eq!(
+        q(&mut a, "SELECT bal FROM acct WHERE id = 1"),
+        rows(&[&["220"]])
+    );
+
+    // The WHERE clause is re-evaluated on the new version.
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "UPDATE acct SET bal = 0 WHERE id = 2");
+    let (_, r) = blocked(
+        &mut b,
+        "UPDATE acct SET bal = bal + 1 WHERE bal = 100",
+        || ok(&mut a, "COMMIT"),
+    );
+    assert_eq!(r.unwrap()[0].tag, "UPDATE 0");
+
+    // A concurrent delete makes the row disappear.
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "DELETE FROM acct WHERE id = 2");
+    let (_, r) = blocked(&mut b, "DELETE FROM acct WHERE id = 2", || {
+        ok(&mut a, "COMMIT")
+    });
+    assert_eq!(r.unwrap()[0].tag, "DELETE 0");
+
+    // A rolled-back change lets the waiter proceed on the original row.
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "UPDATE acct SET bal = -1 WHERE id = 1");
+    let (_, r) = blocked(&mut b, "UPDATE acct SET bal = bal + 1 WHERE id = 1", || {
+        ok(&mut a, "ROLLBACK")
+    });
+    assert_eq!(r.unwrap()[0].tag, "UPDATE 1");
+    assert_eq!(
+        q(&mut a, "SELECT id, bal FROM acct"),
+        rows(&[&["1", "221"]])
+    );
+}
+
+#[test]
+fn snapshot_isolation_reports_serialization_failures() {
+    let db = db();
+    let mut a = db.session();
+    let mut b = db.session();
+    ok(&mut a, "CREATE TABLE t (id INT, v INT)");
+    ok(&mut a, "INSERT INTO t VALUES (1, 0)");
+
+    ok(&mut b, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(q(&mut b, "SELECT v FROM t"), rows(&[&["0"]]));
+    ok(&mut a, "UPDATE t SET v = 1");
+    let e = fails(&mut b, "UPDATE t SET v = 2");
+    assert_eq!(e.code, code::SERIALIZATION_FAILURE);
+    assert_eq!(b.status(), 'E');
+    ok(&mut b, "ROLLBACK");
+
+    // Waiting on a transaction that then commits also fails.
+    ok(&mut b, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    q(&mut b, "SELECT v FROM t");
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "UPDATE t SET v = 3");
+    let (_, r) = blocked(&mut b, "DELETE FROM t", || ok(&mut a, "COMMIT"));
+    assert_eq!(r.unwrap_err().code, code::SERIALIZATION_FAILURE);
+    ok(&mut b, "ROLLBACK");
+    assert_eq!(q(&mut b, "SELECT v FROM t"), rows(&[&["3"]]));
+}
+
+#[test]
+fn deadlocks_are_detected() {
+    let db = db();
+    let mut a = db.session();
+    let mut b = db.session();
+    ok(&mut a, "CREATE TABLE t (id INT)");
+    ok(&mut a, "INSERT INTO t VALUES (1), (2)");
+    ok(&mut a, "BEGIN");
+    ok(&mut b, "BEGIN");
+    ok(&mut a, "UPDATE t SET id = 10 WHERE id = 1");
+    ok(&mut b, "UPDATE t SET id = 20 WHERE id = 2");
+    let (ra, rb) = std::thread::scope(|sc| {
+        let h = sc.spawn(|| b.execute("UPDATE t SET id = 21 WHERE id = 1"));
+        std::thread::sleep(Duration::from_millis(50));
+        let ra = a.execute("UPDATE t SET id = 11 WHERE id = 2");
+        if ra.is_err() {
+            ok(&mut a, "ROLLBACK");
+        } else {
+            ok(&mut a, "COMMIT");
+        }
+        (ra, h.join().unwrap())
+    });
+    let errs: Vec<_> = [&ra, &rb].iter().filter_map(|r| r.as_ref().err()).collect();
+    assert_eq!(errs.len(), 1, "{ra:?} {rb:?}");
+    assert_eq!(errs[0].code, code::DEADLOCK_DETECTED);
+}
