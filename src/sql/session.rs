@@ -468,6 +468,9 @@ impl Session {
                         ConstraintKind::PrimaryKey(_) => format!("{table}_pkey"),
                         ConstraintKind::Unique(cols) => format!("{table}_{}_key", cols.join("_")),
                         ConstraintKind::Check(_) => format!("{table}_check"),
+                        ConstraintKind::ForeignKey { columns, .. } => {
+                            format!("{table}_{}_fkey", columns.join("_"))
+                        }
                     };
                     let mut n = cat.choose_relation_name(txn, &base)?;
                     let mut k = 0;

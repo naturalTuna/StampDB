@@ -28,6 +28,7 @@ pub const RELKIND_INDEX: &str = "i";
 pub const CONTYPE_PRIMARY: &str = "p";
 pub const CONTYPE_UNIQUE: &str = "u";
 pub const CONTYPE_CHECK: &str = "c";
+pub const CONTYPE_FOREIGN: &str = "f";
 
 /// sys_class: oid, relname, relkind, relfilenode, relnatts.
 pub fn class_desc() -> TupleDesc {
@@ -58,9 +59,12 @@ pub fn attribute_desc() -> TupleDesc {
     }
 }
 
-/// sys_constraint: oid, conname, contype, conrelid, conindid (0 for
+/// sys_constraint: oid, conname, contype, conrelid, conindid (the
+/// enforcing unique index; for a foreign key the referenced one; 0 for
 /// CHECK), conkey (column list as in indkey), consrc (CHECK expression as
-/// SQL text, or NULL).
+/// SQL text, or NULL), confrelid (referenced table, 0 if not a foreign
+/// key), confkey, confupdtype and confdeltype (PostgreSQL's action
+/// letters a/r/c/n/d, empty if not a foreign key).
 pub fn constraint_desc() -> TupleDesc {
     TupleDesc {
         attrs: vec![
@@ -69,6 +73,10 @@ pub fn constraint_desc() -> TupleDesc {
             DataType::Text,
             DataType::Int8,
             DataType::Int8,
+            DataType::Text,
+            DataType::Text,
+            DataType::Int8,
+            DataType::Text,
             DataType::Text,
             DataType::Text,
         ],
@@ -189,6 +197,10 @@ pub fn sys_tables() -> [SysTable; 4] {
                 ("conindid", DataType::Int8),
                 ("conkey", DataType::Text),
                 ("consrc", DataType::Text),
+                ("confrelid", DataType::Int8),
+                ("confkey", DataType::Text),
+                ("confupdtype", DataType::Text),
+                ("confdeltype", DataType::Text),
             ],
         ),
     ]

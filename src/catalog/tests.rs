@@ -578,3 +578,134 @@ fn constraints_are_stored_and_enforced_by_indexes() {
         "t_pkey"
     );
 }
+
+#[test]
+fn foreign_keys_resolve_the_referenced_unique_index() {
+    let e = fresh();
+    let mut t = e.begin();
+    let pcols = vec![
+        Column::new("a", DataType::Int4),
+        Column::new("b", DataType::Text),
+        Column::new("c", DataType::Int8),
+    ];
+    let unique = |n: &str, cols: &[&str]| NewConstraint {
+        name: n.into(),
+        kind: ConstraintKind::Unique(cols.iter().map(|c| c.to_string()).collect()),
+    };
+    let pk = NewConstraint {
+        name: "p_pkey".into(),
+        kind: ConstraintKind::PrimaryKey(vec!["c".into()]),
+    };
+    let p = e
+        .cat
+        .create_table_with(&mut t, "p", &pcols, &[pk, unique("p_ab", &["a", "b"])])
+        .unwrap();
+    let fk = |name: &str, cols: &[&str], pc: Option<&[&str]>| NewConstraint {
+        name: name.into(),
+        kind: ConstraintKind::ForeignKey {
+            columns: cols.iter().map(|c| c.to_string()).collect(),
+            parent: "p".into(),
+            parent_columns: pc.map(|v| v.iter().map(|c| c.to_string()).collect()),
+            on_delete: FkAction::Cascade,
+            on_update: FkAction::Restrict,
+        },
+    };
+    let ccols = vec![
+        Column::new("x", DataType::Text),
+        Column::new("y", DataType::Int8),
+        Column::new("z", DataType::Int4),
+    ];
+    // References (b, a) in the order of index p_ab (a, b).
+    let c = e
+        .cat
+        .create_table_with(
+            &mut t,
+            "c",
+            &ccols,
+            &[
+                fk("c_pk_fk", &["y"], None),
+                fk("c_ab_fk", &["x", "z"], Some(&["b", "a"])),
+            ],
+        )
+        .unwrap();
+    let cs = e.cat.constraints_of(&mut t, c.oid).unwrap();
+    let pidx = e.cat.indexes_of(&mut t, p.oid).unwrap();
+    assert_eq!(cs[0].columns, [2]);
+    assert_eq!(cs[0].index, Some(pidx[0].oid));
+    assert_eq!(cs[1].columns, [3, 1], "child columns in index order");
+    let f = cs[1].foreign.clone().unwrap();
+    assert_eq!((f.parent, f.parent_columns.clone()), (p.oid, vec![1, 2]));
+    assert_eq!(
+        (f.on_delete, f.on_update),
+        (FkAction::Cascade, FkAction::Restrict)
+    );
+    assert_eq!(e.cat.referencing(&mut t, p.oid).unwrap().len(), 2);
+
+    t.commit().unwrap();
+
+    // Errors (each aborts its transaction).
+    let bad = |cons: &[NewConstraint]| {
+        let mut t = e.begin();
+        e.cat
+            .create_table_with(&mut t, "bad", &ccols, cons)
+            .unwrap_err()
+    };
+    assert!(matches!(
+        bad(&[fk("f", &["z"], Some(&["a"]))]),
+        CatalogError::InvalidForeignKey(_)
+    ));
+    assert!(matches!(
+        bad(&[fk("f", &["z", "y"], None)]),
+        CatalogError::InvalidForeignKey(_)
+    ));
+    assert!(matches!(
+        bad(&[fk("f", &["x"], None)]),
+        CatalogError::ForeignKeyTypes { .. }
+    ));
+
+    // The parent cannot be dropped while referenced; its index neither.
+    let mut t = e.begin();
+    assert!(matches!(
+        e.cat.drop_table(&mut t, "p"),
+        Err(CatalogError::DependentObjects { .. })
+    ));
+    drop(t);
+    let mut t = e.begin();
+    assert!(matches!(
+        e.cat.drop_index(&mut t, "p_ab"),
+        Err(CatalogError::IndexRequiredByConstraint { .. })
+    ));
+    drop(t);
+    let mut t = e.begin();
+    e.cat.drop_table(&mut t, "c").unwrap();
+    e.cat.drop_table(&mut t, "p").unwrap();
+    t.commit().unwrap();
+
+    // A table may reference itself.
+    let mut t = e.begin();
+    let cols = vec![
+        Column::new("id", DataType::Int4),
+        Column::new("up", DataType::Int4),
+    ];
+    let me = NewConstraint {
+        name: "s_up_fkey".into(),
+        kind: ConstraintKind::ForeignKey {
+            columns: vec!["up".into()],
+            parent: "s".into(),
+            parent_columns: None,
+            on_delete: FkAction::NoAction,
+            on_update: FkAction::NoAction,
+        },
+    };
+    let pk = NewConstraint {
+        name: "s_pkey".into(),
+        kind: ConstraintKind::PrimaryKey(vec!["id".into()]),
+    };
+    let s = e
+        .cat
+        .create_table_with(&mut t, "s", &cols, &[pk, me])
+        .unwrap();
+    assert_eq!(e.cat.referencing(&mut t, s.oid).unwrap().len(), 1);
+    e.cat.drop_table(&mut t, "s").unwrap();
+    t.commit().unwrap();
+}

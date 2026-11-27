@@ -75,6 +75,23 @@ pub enum CatalogError {
     #[error("cannot drop index {index} because constraint {index} on table {table} requires it")]
     IndexRequiredByConstraint { index: String, table: String },
 
+    #[error("{0}")]
+    InvalidForeignKey(String),
+
+    #[error(
+        "foreign key constraint \"{name}\" cannot be implemented: key columns \"{child}\" and \"{parent}\" are of incompatible types: {child_ty} and {parent_ty}"
+    )]
+    ForeignKeyTypes {
+        name: String,
+        child: String,
+        parent: String,
+        child_ty: DataType,
+        parent_ty: DataType,
+    },
+
+    #[error("cannot drop {what} because other objects depend on it")]
+    DependentObjects { what: String },
+
     #[error("corrupt catalog: {0}")]
     Corrupt(&'static str),
 }
@@ -120,6 +137,60 @@ pub enum ConstraintKind {
     Unique(Vec<String>),
     /// CHECK expression as SQL text.
     Check(String),
+    /// FOREIGN KEY (columns) REFERENCES parent (parent_columns; its
+    /// primary key if `None`).
+    ForeignKey {
+        columns: Vec<String>,
+        parent: String,
+        parent_columns: Option<Vec<String>>,
+        on_delete: FkAction,
+        on_update: FkAction,
+    },
+}
+
+/// Referential action (PostgreSQL's confdeltype/confupdtype letters).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FkAction {
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+impl FkAction {
+    fn letter(self) -> &'static str {
+        match self {
+            FkAction::NoAction => "a",
+            FkAction::Restrict => "r",
+            FkAction::Cascade => "c",
+            FkAction::SetNull => "n",
+            FkAction::SetDefault => "d",
+        }
+    }
+
+    fn from_letter(s: &str) -> Result<Self> {
+        Ok(match s {
+            "a" => FkAction::NoAction,
+            "r" => FkAction::Restrict,
+            "c" => FkAction::Cascade,
+            "n" => FkAction::SetNull,
+            "d" => FkAction::SetDefault,
+            _ => return Err(CatalogError::Corrupt("bad foreign key action")),
+        })
+    }
+}
+
+/// The referencing side of a foreign key as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignInfo {
+    /// Referenced table OID.
+    pub parent: u32,
+    /// Referenced columns of the parent, 1-based, in the order of the
+    /// referenced unique index (`ConstraintInfo::columns` matches them).
+    pub parent_columns: Vec<u16>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
 }
 
 /// A constraint to create with a table (names already chosen).
@@ -142,6 +213,9 @@ pub struct ConstraintInfo {
     pub primary: bool,
     /// CHECK expression as SQL text.
     pub check: Option<String>,
+    /// For a FOREIGN KEY: what it references (`index` is the referenced
+    /// unique index).
+    pub foreign: Option<ForeignInfo>,
 }
 
 /// A relation as described by sys_class (and sys_attribute for tables).
@@ -259,11 +333,13 @@ fn attribute_row(relid: u32, attnum: usize, c: &Column) -> Vec<Value> {
 }
 
 fn constraint_row(oid: u32, c: &ConstraintInfo) -> Vec<Value> {
-    let contype = match (&c.check, c.primary) {
-        (Some(_), _) => CONTYPE_CHECK,
-        (None, true) => CONTYPE_PRIMARY,
-        (None, false) => CONTYPE_UNIQUE,
+    let contype = match (&c.check, &c.foreign, c.primary) {
+        (Some(_), _, _) => CONTYPE_CHECK,
+        (None, Some(_), _) => CONTYPE_FOREIGN,
+        (None, None, true) => CONTYPE_PRIMARY,
+        (None, None, false) => CONTYPE_UNIQUE,
     };
+    let f = c.foreign.as_ref();
     vec![
         Value::Int8(i64::from(oid)),
         Value::Text(c.name.clone()),
@@ -272,6 +348,10 @@ fn constraint_row(oid: u32, c: &ConstraintInfo) -> Vec<Value> {
         Value::Int8(i64::from(c.index.unwrap_or(0))),
         Value::Text(format_indkey(&c.columns)),
         c.check.clone().map_or(Value::Null, Value::Text),
+        Value::Int8(f.map_or(0, |f| i64::from(f.parent))),
+        Value::Text(f.map_or_else(String::new, |f| format_indkey(&f.parent_columns))),
+        Value::Text(f.map_or("", |f| f.on_update.letter()).to_owned()),
+        Value::Text(f.map_or("", |f| f.on_delete.letter()).to_owned()),
     ]
 }
 
@@ -289,6 +369,26 @@ fn index_row(
         Value::Bool(unique),
         Value::Bool(primary),
     ]
+}
+
+/// Key column types a foreign key can compare (after implicit casts).
+fn compatible_key_types(a: DataType, b: DataType) -> bool {
+    let text = |t| matches!(t, DataType::Text | DataType::Varchar(_));
+    let num = |t| matches!(t, DataType::Int4 | DataType::Int8 | DataType::Float8);
+    a == b || (text(a) && text(b)) || (num(a) && num(b))
+}
+
+/// The foreign key part of a sys_constraint row.
+fn foreign_of(r: &[Value]) -> Result<Option<ForeignInfo>> {
+    if text(r, 2)? != CONTYPE_FOREIGN {
+        return Ok(None);
+    }
+    Ok(Some(ForeignInfo {
+        parent: int(r, 7)? as u32,
+        parent_columns: parse_indkey(&text(r, 8)?)?,
+        on_update: FkAction::from_letter(&text(r, 9)?)?,
+        on_delete: FkAction::from_letter(&text(r, 10)?)?,
+    }))
 }
 
 fn desc_of(table: RelFileId) -> Result<TupleDesc> {
@@ -507,6 +607,9 @@ impl Catalog {
                     attnums(cols, &columns)?;
                 }
                 ConstraintKind::Check(_) => {}
+                ConstraintKind::ForeignKey { columns: cols, .. } => {
+                    attnums(cols, &columns)?;
+                }
             }
         }
         let columns = &columns[..];
@@ -542,6 +645,7 @@ impl Catalog {
                 columns: Vec::new(),
                 primary: false,
                 check: None,
+                foreign: None,
             };
             match &c.kind {
                 ConstraintKind::PrimaryKey(cols) | ConstraintKind::Unique(cols) => {
@@ -558,9 +662,34 @@ impl Catalog {
                     con.index = Some(idx.oid);
                 }
                 ConstraintKind::Check(expr) => con.check = Some(expr.clone()),
+                ConstraintKind::ForeignKey {
+                    columns: cols,
+                    parent,
+                    parent_columns,
+                    on_delete,
+                    on_update,
+                } => {
+                    let (child_cols, index, foreign) = self.resolve_foreign_key(
+                        txn,
+                        &info,
+                        &c.name,
+                        &attnums(cols, columns)?,
+                        parent,
+                        parent_columns.as_deref(),
+                    )?;
+                    con.columns = child_cols;
+                    con.index = Some(index);
+                    con.foreign = Some(ForeignInfo {
+                        on_delete: *on_delete,
+                        on_update: *on_update,
+                        ..foreign
+                    });
+                }
             }
             let coid = self.engine.allocate_oid()?;
             self.insert_row_checked(txn, SYS_CONSTRAINT, &constraint_row(coid, &con), &c.name)?;
+            // Later constraints (a self-referencing foreign key) see it.
+            txn.next_command();
         }
         txn.next_command();
         Ok(info)
@@ -585,10 +714,145 @@ impl Catalog {
                 columns: parse_indkey(&text(&r, 5)?)?,
                 primary: text(&r, 2)? == CONTYPE_PRIMARY,
                 check: opt_text(&r, 6)?,
+                foreign: foreign_of(&r)?,
             });
         }
         out.sort_by_key(|c| c.oid);
         Ok(out)
+    }
+
+    /// Foreign keys (of any table) referencing the table with OID
+    /// `parent`, by OID. (sys_constraint has no index on confrelid; it is
+    /// scanned.)
+    pub fn referencing(&self, txn: &mut Transaction, parent: u32) -> Result<Vec<ConstraintInfo>> {
+        let snap = txn.snapshot();
+        let me = Me {
+            xid: txn.xid(),
+            cid: txn.command_id(),
+        };
+        let mut out = Vec::new();
+        for r in self.heap(SYS_CONSTRAINT)?.scan_mvcc(snap, me, txn.tm())? {
+            let r = deform_tuple(&constraint_desc(), &r?.1)?;
+            let Some(foreign) = foreign_of(&r)? else {
+                continue;
+            };
+            if foreign.parent != parent {
+                continue;
+            }
+            let index = int(&r, 4)? as u32;
+            out.push(ConstraintInfo {
+                oid: int(&r, 0)? as u32,
+                name: text(&r, 1)?,
+                table: int(&r, 3)? as u32,
+                index: (index != 0).then_some(index),
+                columns: parse_indkey(&text(&r, 5)?)?,
+                primary: false,
+                check: None,
+                foreign: Some(foreign),
+            });
+        }
+        out.sort_by_key(|c| c.oid);
+        Ok(out)
+    }
+
+    /// Finds the unique index of `parent` a foreign key references and
+    /// orders the key columns like it: (child columns, index OID, info).
+    fn resolve_foreign_key(
+        &self,
+        txn: &mut Transaction,
+        child: &RelationInfo,
+        name: &str,
+        child_cols: &[u16],
+        parent: &str,
+        parent_columns: Option<&[String]>,
+    ) -> Result<(Vec<u16>, u32, ForeignInfo)> {
+        let p = if parent == child.name {
+            child.clone()
+        } else {
+            let p = self
+                .lookup_relation(txn, parent)?
+                .filter(|r| r.kind == RelKind::Table)
+                .ok_or_else(|| CatalogError::UndefinedRelation(parent.to_owned()))?;
+            // Keeps the parent's definition stable (PostgreSQL takes
+            // ShareRowExclusive on the referenced table).
+            txn.lock_relation(RelFileId(p.oid), LockMode::ShareRowExclusive)?;
+            p
+        };
+        let parent_cols: Vec<u16> = match parent_columns {
+            Some(names) => names
+                .iter()
+                .map(|n| {
+                    p.columns
+                        .iter()
+                        .position(|c| c.name == *n)
+                        .map(|i| (i + 1) as u16)
+                        .ok_or_else(|| CatalogError::KeyColumnMissing(n.clone()))
+                })
+                .collect::<Result<_>>()?,
+            None => self
+                .constraints_of(txn, p.oid)?
+                .into_iter()
+                .find(|c| c.primary)
+                .map(|c| c.columns)
+                .ok_or_else(|| {
+                    CatalogError::InvalidForeignKey(format!(
+                        "there is no primary key for referenced table \"{}\"",
+                        p.name
+                    ))
+                })?,
+        };
+        if parent_cols.len() != child_cols.len() {
+            return Err(CatalogError::InvalidForeignKey(
+                "number of referencing and referenced columns for foreign key disagree".into(),
+            ));
+        }
+        let mut wanted = parent_cols.clone();
+        wanted.sort_unstable();
+        let index = self
+            .indexes_of(txn, p.oid)?
+            .into_iter()
+            .find(|i| {
+                let mut cols = i.columns.clone();
+                cols.sort_unstable();
+                i.unique && cols == wanted
+            })
+            .ok_or_else(|| {
+                CatalogError::InvalidForeignKey(format!(
+                    "there is no unique constraint matching given keys for referenced table \"{}\"",
+                    p.name
+                ))
+            })?;
+        // Order the pairs like the index columns.
+        let mut ordered_child = Vec::new();
+        for ic in &index.columns {
+            let k = parent_cols
+                .iter()
+                .position(|c| c == ic)
+                .ok_or(CatalogError::Corrupt("index column not in key"))?;
+            let (cc, pc) = (child_cols[k], *ic);
+            let ct = &child.columns[usize::from(cc) - 1];
+            let pt = &p.columns[usize::from(pc) - 1];
+            if !compatible_key_types(ct.ty, pt.ty) {
+                return Err(CatalogError::ForeignKeyTypes {
+                    name: name.to_owned(),
+                    child: ct.name.clone(),
+                    parent: pt.name.clone(),
+                    child_ty: ct.ty,
+                    parent_ty: pt.ty,
+                });
+            }
+            ordered_child.push(cc);
+        }
+        Ok((
+            ordered_child,
+            index.oid,
+            ForeignInfo {
+                parent: p.oid,
+                parent_columns: index.columns.clone(),
+                on_delete: FkAction::NoAction,
+                on_update: FkAction::NoAction,
+            },
+        ))
     }
 
     /// A free relation name: `base`, else `base1`, `base2`, ...
@@ -617,6 +881,15 @@ impl Catalog {
             .lookup_relation(txn, name)?
             .filter(|r| r.kind == RelKind::Table && r.oid == info.oid)
             .ok_or_else(|| CatalogError::UndefinedRelation(name.to_owned()))?;
+        if self
+            .referencing(txn, info.oid)?
+            .iter()
+            .any(|c| c.table != info.oid)
+        {
+            return Err(CatalogError::DependentObjects {
+                what: format!("table {name}"),
+            });
+        }
         for idx in self.indexes_of(txn, info.oid)? {
             self.drop_index_rows(txn, idx.oid)?;
             txn.drop_on_commit(idx.rel);
@@ -761,6 +1034,15 @@ impl Catalog {
             return Err(CatalogError::IndexRequiredByConstraint {
                 index: name.to_owned(),
                 table,
+            });
+        }
+        if self
+            .referencing(txn, table)?
+            .iter()
+            .any(|c| c.index == Some(idx.oid))
+        {
+            return Err(CatalogError::DependentObjects {
+                what: format!("index {name}"),
             });
         }
         self.drop_index_rows(txn, idx.oid)?;

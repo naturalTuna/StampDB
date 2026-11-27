@@ -195,6 +195,11 @@ impl From<CatalogError> for SqlError {
             CatalogError::DuplicateConstraint { .. } => Self::new(code::DUPLICATE_OBJECT, msg),
             CatalogError::MultiplePrimaryKeys(_) => Self::new(code::INVALID_TABLE_DEFINITION, msg),
             CatalogError::KeyColumnMissing(_) => Self::new(code::UNDEFINED_COLUMN, msg),
+            CatalogError::InvalidForeignKey(_) => Self::new(code::INVALID_FOREIGN_KEY, msg),
+            CatalogError::ForeignKeyTypes { .. } => Self::new(code::DATATYPE_MISMATCH, msg),
+            CatalogError::DependentObjects { .. } => {
+                Self::new(code::DEPENDENT_OBJECTS_STILL_EXIST, msg)
+            }
             CatalogError::IndexRequiredByConstraint { .. } => {
                 Self::new(code::DEPENDENT_OBJECTS_STILL_EXIST, msg)
             }
