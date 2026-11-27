@@ -7,6 +7,38 @@ pub enum StorageError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// OS I/O failure on a specific file.
+    #[error("{op} {}: {source}", path.display())]
+    FileIo {
+        op: &'static str,
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Read hit end of file before filling the buffer.
+    #[error("short read from {file} at offset {offset} (len {len})")]
+    ShortRead {
+        file: crate::storage::backend::FileKey,
+        offset: u64,
+        len: usize,
+    },
+
+    /// Direct I/O offset, length or buffer address is not aligned.
+    #[error("misaligned direct I/O {what}: {value}")]
+    Misaligned { what: &'static str, value: u64 },
+
+    /// Device logical block size could not be determined (startup refused).
+    #[error("cannot determine logical block size for {}: {reason}", path.display())]
+    BlockSizeUnknown {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+
+    /// Device logical block size is not supported (startup refused).
+    #[error("unsupported logical block size {size} (must divide 4096)")]
+    BlockSizeUnsupported { size: u64 },
+
     /// Direct I/O buffer length is zero or not a multiple of the alignment.
     #[error("invalid aligned buffer size: {len}")]
     InvalidBufferSize { len: usize },
