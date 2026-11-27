@@ -763,8 +763,8 @@ pub fn redo(info: u8, idx: usize, block: &BlockRef, page: &mut [u8]) -> Result<(
         (info::DELETE, 0) => redo_xmax(page, d, None),
         (info::PRUNE, 0) => {
             let mut p = SlottedPage::open(page)?;
-            for c in d.chunks_exact(2) {
-                p.mark_dead(SlotId(u16::from_le_bytes([c[0], c[1]])))?;
+            for c in d.as_chunks::<2>().0 {
+                p.mark_dead(SlotId(u16::from_le_bytes(*c)))?;
             }
             p.compact();
             Ok(())
