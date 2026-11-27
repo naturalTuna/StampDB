@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod buffer;
+pub mod catalog;
 pub mod lock;
 pub mod storage;
 pub mod txn;
