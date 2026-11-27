@@ -9,8 +9,12 @@ Rust로 구현하는 학습용 OLTP 데이터베이스. PostgreSQL 와이어 프
 - `DESIGN.md`의 decisions, ha_and_backup_design, open_questions는 사용자가 명시적으로 지시할 때만 수정한다.
 
 ## 현재 단계
-- 1단계 5번: WAL + 체크포인트 + 백그라운드 writer + 크래시 복구 (redo 우선, full page write, hint bit FPI, kill -9 테스트 통과)
+- 1단계 6번: 트랜잭션 + MVCC + 스냅샷 (Read Committed, Snapshot Isolation, trait 추상화, 통합 lock manager, deadlock 검출, lock_timeout)
   (단계가 끝나면 사용자가 이 줄을 갱신한다)
+
+## 진행 상황과 환경
+- 진행 상황과 남은 한계는 `docs/PROGRESS.md`, 환경 구성과 재개 방법은 `docs/SETUP.md`, 구현 중 미결 사항은 `docs/notes.md`.
+- 단계를 마치면 `docs/PROGRESS.md`를 갱신한다.
 
 ## 작업 방식
 - 새 모듈은 코드를 쓰기 전에 설계(자료구조, 레이아웃, 트레이드오프, PG/Oracle과의 비교)를 짧게 제시하고 동의를 받는다.
