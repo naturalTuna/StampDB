@@ -54,6 +54,8 @@ pub mod info {
     pub const UPDATE_SAME: u8 = 3;
     /// Block 0: slots newly marked dead (u16 each); the page is compacted.
     pub const PRUNE: u8 = 4;
+    /// Block 0: DEAD slots made unused (u16 each); the page is compacted.
+    pub const VACUUM: u8 = 5;
 }
 
 /// Errors from heap operations.
@@ -123,8 +125,31 @@ impl HeapFile {
                 return Ok(p.tid);
             }
         }
-        // Target full (or none): append a block. Concurrent inserters may
-        // each extend; that only costs a little space.
+        // Then a block vacuum freed space in.
+        let need = tuple
+            .len()
+            .next_multiple_of(crate::storage::slotted::ITEM_ALIGN)
+            + crate::storage::slotted::LINE_POINTER_SIZE;
+        for _ in 0..4 {
+            let Some(blk) = self.pool.fsm().find(self.rel, need) else {
+                break;
+            };
+            let blk = BlockNumber(blk);
+            let pin = self.pool.fetch(self.tag(blk))?;
+            let mut page = pin.write();
+            let placed = place(&mut page, blk, tuple)?;
+            if let Some(p) = &placed {
+                self.log_insert(&mut page, p);
+            }
+            self.pool
+                .fsm()
+                .record(self.rel, blk.0, free_for_insert(&page)?);
+            if let Some(p) = placed {
+                return Ok(p.tid);
+            }
+        }
+        // Otherwise append a block. Concurrent inserters may each extend;
+        // that only costs a little space.
         let (blk, pin) = self.pool.extend(self.rel)?;
         let mut page = pin.write();
         let p = place(&mut page, blk, tuple)?.ok_or(too_large(tuple))?;
@@ -428,6 +453,44 @@ impl HeapFile {
             })
             .map(|slot| Tid { blk, slot })
             .collect())
+    }
+
+    /// Vacuum's last heap step: marks `slots` of `blk` (DEAD, and no longer
+    /// referenced by any index) unused so they can be reused, compacts the
+    /// page, records its free space in the free space map, and logs a VACUUM
+    /// record. Slots that are not DEAD are skipped. Returns how many were
+    /// made unused.
+    pub fn vacuum_page(&self, blk: BlockNumber, slots: &[SlotId]) -> Result<usize> {
+        let pin = self.pool.fetch(self.tag(blk))?;
+        let mut page = pin.write();
+        if is_new_page(&page) {
+            return Ok(0);
+        }
+        let mut done = Vec::new();
+        {
+            let mut p = SlottedPage::open(&mut page[..])?;
+            for &slot in slots {
+                if p.item_id(slot)
+                    .is_some_and(|id| id.state == crate::storage::slotted::ItemState::Dead)
+                {
+                    p.mark_unused(slot)?;
+                    done.push(slot);
+                }
+            }
+            if !done.is_empty() {
+                p.compact();
+            }
+        }
+        if !done.is_empty() {
+            page.mark_dirty();
+            let mut b = BlockRef::new(self.rel, blk);
+            b.data = done.iter().flat_map(|s| s.0.to_le_bytes()).collect();
+            self.log1(Record::new(RmgrId::Heap, info::VACUUM), b, &mut page);
+        }
+        self.pool
+            .fsm()
+            .record(self.rel, blk.0, free_for_insert(&page)?);
+        Ok(done.len())
     }
 
     /// Sequential scan returning only versions visible to `snap`, setting
@@ -761,6 +824,14 @@ pub fn redo(info: u8, idx: usize, block: &BlockRef, page: &mut [u8]) -> Result<(
             d.get(2..).ok_or(HeapError::Redo("short data"))?,
         ),
         (info::DELETE, 0) => redo_xmax(page, d, None),
+        (info::VACUUM, 0) => {
+            let mut p = SlottedPage::open(page)?;
+            for c in d.as_chunks::<2>().0 {
+                p.mark_unused(SlotId(u16::from_le_bytes(*c)))?;
+            }
+            p.compact();
+            Ok(())
+        }
         (info::PRUNE, 0) => {
             let mut p = SlottedPage::open(page)?;
             for c in d.as_chunks::<2>().0 {
@@ -900,6 +971,16 @@ impl Iterator for HeapMvccScan<'_> {
             }
         }
     }
+}
+
+/// Bytes an insert can use on a page (data + line pointer); an all-zero
+/// page counts as empty.
+fn free_for_insert(page: &[u8]) -> Result<usize> {
+    if is_new_page(page) {
+        return Ok(crate::storage::slotted::MAX_ITEM_SIZE);
+    }
+    let p = SlottedPage::open(page)?;
+    Ok(p.upper() - p.lower())
 }
 
 fn check_size(tuple: &[u8]) -> Result<()> {
@@ -1856,6 +1937,55 @@ mod tests {
                     .unwrap(),
                 dead
             );
+        }
+
+        #[test]
+        fn vacuumed_space_is_reused_through_the_fsm() {
+            let e = env();
+            let tm = e.engine.txn().clone();
+            let tids: Vec<Tid> = (0..800).map(|i| committed_row(&e, i)).collect();
+            let blocks = e.heap.nblocks().unwrap();
+            assert!(blocks > 2);
+            // Delete every row of block 0, then vacuum it (no indexes).
+            let victims: Vec<Tid> = tids.iter().copied().filter(|t| t.blk.0 == 0).collect();
+            let mut d = e.begin(Isolation::ReadCommitted);
+            for &t in &victims {
+                e.heap.delete_mvcc(t, &mut d).unwrap();
+            }
+            d.commit().unwrap();
+            let dead = e
+                .heap
+                .prune_page(BlockNumber(0), tm.oldest_xmin(), tm.as_ref())
+                .unwrap();
+            assert_eq!(dead.len(), victims.len());
+            let slots: Vec<SlotId> = dead.iter().map(|t| t.slot).collect();
+            assert_eq!(
+                e.heap.vacuum_page(BlockNumber(0), &slots).unwrap(),
+                slots.len()
+            );
+            assert_eq!(
+                e.heap.vacuum_page(BlockNumber(0), &slots).unwrap(),
+                0,
+                "already unused"
+            );
+
+            // Re-inserting as many rows fills the last block's remainder,
+            // then block 0 through the FSM, without extending the heap.
+            let placed: Vec<Tid> = (0..victims.len() as i64)
+                .map(|i| committed_row(&e, 10_000 + i))
+                .collect();
+            assert!(
+                placed.iter().any(|t| t.blk == BlockNumber(0)),
+                "space in block 0 reused"
+            );
+            assert_eq!(e.heap.nblocks().unwrap(), blocks, "no extension needed");
+
+            e.engine.wal().flush_all();
+            let mem = e.mem.clone();
+            drop(e);
+            let e = start(&mem);
+            let mut r = e.begin(Isolation::ReadCommitted);
+            assert_eq!(e.ids(&mut r).len(), 800, "same row count after crash");
         }
 
         #[test]

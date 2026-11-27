@@ -113,6 +113,8 @@ pub struct BufferPool {
     /// WAL to flush before writing a page (WAL-before-data); `None` for
     /// unlogged use (tests of the pool itself).
     wal: Option<Arc<Wal>>,
+    /// Free space of heap blocks (advisory, in memory).
+    fsm: super::fsm::FreeSpaceMap,
 }
 
 impl BufferPool {
@@ -144,6 +146,7 @@ impl BufferPool {
             disk,
             control,
             wal: None,
+            fsm: super::fsm::FreeSpaceMap::default(),
         })
     }
 
@@ -157,6 +160,11 @@ impl BufferPool {
     /// Current fencing token (from the flush control).
     pub fn fence_token(&self) -> crate::storage::backend::FenceToken {
         self.control.fence_token()
+    }
+
+    /// Free space map shared by everyone using this pool.
+    pub fn fsm(&self) -> &super::fsm::FreeSpaceMap {
+        &self.fsm
     }
 
     /// The attached WAL, if any.

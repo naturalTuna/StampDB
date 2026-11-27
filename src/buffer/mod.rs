@@ -23,6 +23,7 @@
 
 mod control;
 mod error;
+pub mod fsm;
 mod guard;
 mod pool;
 
