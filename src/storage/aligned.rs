@@ -74,6 +74,18 @@ impl DerefMut for AlignedBuf {
     }
 }
 
+impl AsRef<[u8]> for AlignedBuf {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl AsMut<[u8]> for AlignedBuf {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self
+    }
+}
+
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
         // SAFETY: `ptr` was returned by `alloc_zeroed` with this exact `layout`

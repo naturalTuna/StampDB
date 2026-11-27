@@ -94,7 +94,7 @@ pub struct PageHeader {
     pub kind: PageKind,
 }
 
-mod off {
+pub(super) mod off {
     pub const LSN: usize = 0;
     pub const CHECKSUM: usize = 8;
     pub const FLAGS: usize = 12;
@@ -205,7 +205,7 @@ pub fn is_new_page(page: &[u8]) -> bool {
     page.iter().all(|&b| b == 0)
 }
 
-fn check_page_len(page: &[u8]) -> Result<()> {
+pub(super) fn check_page_len(page: &[u8]) -> Result<()> {
     if page.len() != PAGE_SIZE {
         return Err(StorageError::InvalidPageLength { len: page.len() });
     }
@@ -216,19 +216,19 @@ fn to_u16(v: usize) -> Result<u16> {
     u16::try_from(v).map_err(|_| StorageError::CorruptPage("offset exceeds u16"))
 }
 
-fn read_u16(b: &[u8], at: usize) -> u16 {
+pub(super) fn read_u16(b: &[u8], at: usize) -> u16 {
     let mut a = [0u8; 2];
     a.copy_from_slice(&b[at..at + 2]);
     u16::from_le_bytes(a)
 }
 
-fn read_u32(b: &[u8], at: usize) -> u32 {
+pub(super) fn read_u32(b: &[u8], at: usize) -> u32 {
     let mut a = [0u8; 4];
     a.copy_from_slice(&b[at..at + 4]);
     u32::from_le_bytes(a)
 }
 
-fn read_u64(b: &[u8], at: usize) -> u64 {
+pub(super) fn read_u64(b: &[u8], at: usize) -> u64 {
     let mut a = [0u8; 8];
     a.copy_from_slice(&b[at..at + 8]);
     u64::from_le_bytes(a)

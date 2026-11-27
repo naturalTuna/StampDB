@@ -18,6 +18,21 @@ pub enum StorageError {
     /// A page header failed validation.
     #[error("corrupt page: {0}")]
     CorruptPage(&'static str),
+
+    /// Item length is zero or exceeds `MAX_ITEM_SIZE`.
+    #[error("invalid item size: {len}")]
+    InvalidItemSize { len: usize },
+
+    /// Slot number is beyond the line pointer array.
+    #[error("slot {slot} does not exist")]
+    InvalidSlot { slot: u16 },
+
+    /// Operation not allowed in the slot's current state.
+    #[error("slot {slot} is in state {state:?}")]
+    InvalidSlotState {
+        slot: u16,
+        state: crate::storage::slotted::ItemState,
+    },
 }
 
 /// Result alias for the storage layer.

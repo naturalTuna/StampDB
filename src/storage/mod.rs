@@ -3,6 +3,7 @@
 mod aligned;
 mod error;
 pub mod page;
+pub mod slotted;
 
 pub use aligned::{AlignedBuf, IO_ALIGN};
 pub use error::{Result, StorageError};
