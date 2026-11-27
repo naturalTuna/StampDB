@@ -200,6 +200,12 @@ impl PageHeader {
     }
 }
 
+/// Page LSN read directly from the header bytes (no validation; an all-zero
+/// page yields `Lsn::INVALID`). `page` must be at least 8 bytes.
+pub fn page_lsn(page: &[u8]) -> Lsn {
+    Lsn(read_u64(page, off::LSN))
+}
+
 /// True if `page` is entirely zero (allocated but never initialized).
 pub fn is_new_page(page: &[u8]) -> bool {
     page.iter().all(|&b| b == 0)

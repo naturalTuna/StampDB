@@ -21,10 +21,12 @@
 //! content lock. Lock guards borrow the pin guard, so a lock is always
 //! released before its pin.
 
+mod control;
 mod error;
 mod guard;
 mod pool;
 
+pub use control::{FlushControl, SingleModeFlush};
 pub use error::{BufferError, Result};
 pub use guard::{PageMut, PageRef, PinGuard};
-pub use pool::{BufferPool, BufferTag, MAX_USAGE_COUNT, NUM_PARTITIONS};
+pub use pool::{BufferPool, BufferTag, FlushOutcome, MAX_USAGE_COUNT, NUM_PARTITIONS};

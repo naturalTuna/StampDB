@@ -1,7 +1,7 @@
 //! In-memory `StorageBackend` for unit tests.
 //!
-//! Enforces the same alignment rules as the real backend, counts reads, and
-//! allows corrupting stored bytes.
+//! Enforces the same alignment rules as the real backend, counts I/O, and
+//! records the fencing tokens it receives. Allows corrupting stored bytes.
 
 use std::collections::HashMap;
 use std::io;
@@ -17,11 +17,31 @@ use super::{Result, StorageError};
 pub(crate) struct MemBackend {
     files: Mutex<HashMap<FileKey, Vec<u8>>>,
     reads: AtomicUsize,
+    writes: AtomicUsize,
+    /// Tokens of every mutating call, in order.
+    fences: Mutex<Vec<FenceToken>>,
 }
 
 impl MemBackend {
     pub(crate) fn reads(&self) -> usize {
         self.reads.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn writes(&self) -> usize {
+        self.writes.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn fences(&self) -> Vec<FenceToken> {
+        self.fences.lock().clone()
+    }
+
+    /// Copies `len` bytes of a stored file at `offset`.
+    pub(crate) fn raw(&self, file: FileKey, offset: usize, len: usize) -> Vec<u8> {
+        self.files
+            .lock()
+            .get(&file)
+            .map(|d| d[offset..offset + len].to_vec())
+            .unwrap_or_default()
     }
 
     /// Flips one byte of a stored file.
@@ -58,8 +78,10 @@ impl StorageBackend for MemBackend {
         Ok(())
     }
 
-    fn write_at(&self, file: FileKey, offset: u64, buf: &[u8], _fence: FenceToken) -> Result<()> {
+    fn write_at(&self, file: FileKey, offset: u64, buf: &[u8], fence: FenceToken) -> Result<()> {
         check_io_alignment(offset, buf)?;
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.fences.lock().push(fence);
         let mut files = self.files.lock();
         let data = files.get_mut(&file).ok_or_else(|| not_found(file))?;
         let start = offset as usize;
@@ -70,7 +92,8 @@ impl StorageBackend for MemBackend {
         Ok(())
     }
 
-    fn create(&self, file: FileKey, _fence: FenceToken) -> Result<()> {
+    fn create(&self, file: FileKey, fence: FenceToken) -> Result<()> {
+        self.fences.lock().push(fence);
         let mut files = self.files.lock();
         if files.contains_key(&file) {
             return Err(StorageError::FileIo {
@@ -83,7 +106,8 @@ impl StorageBackend for MemBackend {
         Ok(())
     }
 
-    fn remove(&self, file: FileKey, _fence: FenceToken) -> Result<()> {
+    fn remove(&self, file: FileKey, fence: FenceToken) -> Result<()> {
+        self.fences.lock().push(fence);
         self.files
             .lock()
             .remove(&file)
@@ -91,7 +115,8 @@ impl StorageBackend for MemBackend {
             .ok_or_else(|| not_found(file))
     }
 
-    fn truncate(&self, file: FileKey, len: u64, _fence: FenceToken) -> Result<()> {
+    fn truncate(&self, file: FileKey, len: u64, fence: FenceToken) -> Result<()> {
+        self.fences.lock().push(fence);
         let mut files = self.files.lock();
         let data = files.get_mut(&file).ok_or_else(|| not_found(file))?;
         data.resize(len as usize, 0);
