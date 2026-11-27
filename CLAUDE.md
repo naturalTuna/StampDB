@@ -9,7 +9,7 @@ Rust로 구현하는 학습용 OLTP 데이터베이스. PostgreSQL 와이어 프
 - `DESIGN.md`의 decisions, ha_and_backup_design, open_questions는 사용자가 명시적으로 지시할 때만 수정한다.
 
 ## 현재 단계
-- 1단계 7번: 수동 VACUUM (heap + 인덱스 + 빈 B+Tree 페이지 삭제)
+- 1단계 8번: 카탈로그 (시스템 테이블)
   (단계가 끝나면 사용자가 이 줄을 갱신한다)
 
 ## 진행 상황과 환경

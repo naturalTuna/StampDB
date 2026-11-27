@@ -4,6 +4,8 @@
 decisions의 변경은 채팅 리뷰를 거친 뒤에만 반영하고, 반영 시 아래 변경 이력에 남긴다.
 
 ## 변경 이력
+- r9 (2026-11-27)
+  - [이동] open_questions의 DDL 트랜잭션성을 decisions로 이동: PG처럼 트랜잭션 DDL, 카탈로그는 MVCC 테이블.
 - r8 (2026-11-27)
   - [추가] vacuum: 트랜잭션별 스냅샷 xmin 등록으로 horizon 계산, ShareUpdateExclusive 테이블 lock.
   - [추가] FSM은 vacuum이 갱신하는 메모리 기반(영속화·WAL 없음).
@@ -228,6 +230,12 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - 행 갱신 충돌 시 xmax 트랜잭션의 종료를 lock manager로 기다린 뒤 재시도한다 (PG의 튜플 lock 단계는 두지 않는다). 대기 순서의 공정성은 보장하지 않는다.
 - SAVEPOINT와 하위 트랜잭션은 지원하지 않는다 (필요해지면 open_questions로).
 
+[카탈로그]
+- DDL은 트랜잭션의 일부다 (PG와 동일). `BEGIN; CREATE TABLE ...; ROLLBACK;`이면 테이블이 사라진다.
+  카탈로그는 일반 MVCC heap 테이블로 두고, DDL은 카탈로그 행의 삽입/삭제로 표현한다.
+  근거: 기존 MVCC/WAL/vacuum을 재사용하고, 크래시 후에도 커밋 기준으로 정확하며, reader 노드가 WAL 재생만으로 카탈로그를 일관되게 읽는다. sqllogictest의 PG 비교와도 맞는다.
+  비용: 카탈로그 캐시 무효화, DROP한 파일의 커밋 후 삭제, 롤백된 CREATE의 파일 정리가 필요하다.
+
 [제약조건]
 - NOT NULL, CHECK, PRIMARY KEY, UNIQUE, FOREIGN KEY.
 - PK와 UNIQUE는 B+Tree 인덱스로 강제한다.
@@ -377,7 +385,6 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
   통계 뷰(pg_stat_activity, pg_stat_user_tables, pg_locks)는 12단계 통계 수집 시 함께 노출.
 
 [미결]
-- DDL의 트랜잭션성: BEGIN; CREATE TABLE ...; ROLLBACK; 이 되는가. 카탈로그를 MVCC 테이블로 할지를 결정하며 8단계 설계에 큰 영향. PG는 트랜잭션 DDL, Oracle은 암묵적 커밋. 8단계 전 결정.
 - 복제/witness 채널의 인증: 노드 간 WAL 스트림, 승격 명령, witness 통신을 trust + IP 목록으로 둘지, 별도 인증(공유 비밀, mTLS 등)을 둘지. 14단계 전 결정.
 - 목표 RPO/RTO (기본 복제 모드와 lease 시간 결정에 사용): 추후. 17단계 전 결정.
 - 다중 서버 공유 스토리지 방식 (OCFS2, GFS2, 블록 디바이스 직접 관리 등)과 스토리지 레벨 fencing 방식: 추후. 18단계 전 결정.
