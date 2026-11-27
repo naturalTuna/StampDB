@@ -4,6 +4,11 @@
 decisions의 변경은 채팅 리뷰를 거친 뒤에만 반영하고, 반영 시 아래 변경 이력에 남긴다.
 
 ## 변경 이력
+- r4 (2026-11-27)
+  - [추가] hint bit 설정 방식: shared lock 아래에서는 설정하지 않고, exclusive lock을 얻었을 때(try_write 성공, 페이지 수정, vacuum)만 설정.
+  - [추가] 튜플 헤더: cmin/cmax를 별도 필드로 저장 (combo CID 없음). 속성은 정렬 패딩 없이 연속 저장.
+  - [이동] open_questions의 NUMERIC 항목을 decisions로 이동: 3단계에서 가변 길이(varlena) 일반화, NUMERIC은 9단계 이후 base-10000으로 구현.
+  - [이동] open_questions의 pg_catalog 항목 중 타입 OID 고정을 decisions로 이동.
 - r3 (2026-11-27)
   - [수정] Direct I/O 세부: 디바이스 논리 블록 크기 확인을 BLKSSZGET에서 sysfs(`/sys/dev/block/<major>:<minor>/queue/logical_block_size`)로 변경. 값을 구할 수 없으면 기동 거부.
   - [추가] 페이지 체크섬 알고리즘: CRC32C(32비트), 블록 번호 포함.
@@ -106,6 +111,11 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - INT4, INT8, BOOL, TEXT, VARCHAR(n), FLOAT8, TIMESTAMP(타임존 없음).
 - TIMESTAMP는 2000-01-01 00:00:00 기준 마이크로초를 int64로 저장한다 (PG와 동일).
 - NULL은 PG처럼 튜플 헤더의 null bitmap으로 처리한다.
+- 가변 길이 타입은 공통 varlena 형식(1바이트 또는 4바이트 길이 헤더, 외부 저장 포인터용 플래그 예약)으로 일반화한다.
+- NUMERIC은 9단계 이후 PG처럼 base-10000 digit 배열로 구현한다.
+  근거: rust_decimal은 28자리 제한으로 PG와 결과가 달라 sqllogictest 비교가 깨진다.
+- 타입 OID는 PG 값으로 고정한다 (bool=16, int8=20, int4=23, text=25, float8=701, varchar=1043, timestamp=1114, numeric=1700).
+  근거: RowDescription에 실려 드라이버가 해석하므로 PG와 같아야 한다.
 
 [인코딩과 정렬]
 - 인코딩은 UTF-8만 지원한다.
@@ -119,6 +129,10 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - slotted page 레이아웃, heap + B+Tree 인덱스.
 - 페이지 헤더에 page LSN을 둔다 (WAL 적용 여부 판단 및 reader 재생에 사용).
 - 한 페이지에 들어가지 않는 튜플은 overflow 처리(TOAST 유사)를 둔다. 초기에는 최대 크기 제한으로 대체 가능.
+- 튜플 헤더의 cmin/cmax는 별도 필드로 저장한다.
+  근거: PG의 combo CID(같은 트랜잭션이 삽입 후 삭제한 경우의 매핑)를 없앤다. 헤더 4바이트 증가를 감수한다.
+- 튜플의 속성은 정렬 패딩 없이 연속 저장하고, 바이트 단위로 디코드한다.
+  근거: PG의 typalign은 C 구조체 직접 접근을 위한 것이다. 바이트 디코드 방식에서는 공간만 낭비한다.
 - 페이지 체크섬 사용. torn page 대응(full page write)은 디바이스의 원자적 쓰기 보장에 기대지 않고 유지한다.
   - 알고리즘은 CRC32C(32비트). 체크섬 필드를 0으로 둔 페이지 전체와 블록 번호를 함께 계산한다. 전부 0인 페이지는 새 페이지로 보고 검사를 통과시킨다.
     근거: x86_64에서 SSE4.2 하드웨어 가속을 받고, PG의 16비트 FNV 변형보다 검출력이 높다. 블록 번호를 섞어 엉뚱한 위치에 쓰인 페이지를 검출한다 (PG와 동일).
@@ -128,6 +142,8 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
   - "커밋됨" hint는 해당 트랜잭션의 커밋 WAL 레코드가 flush된 뒤에만 설정한다.
   - 가시성 판단은 스냅샷 검사를 hint bit보다 먼저 한다. hint가 "커밋됨"이어도 스냅샷상 진행 중인 xid면 보이지 않는다.
     근거: reader는 자신의 재생 시점보다 나중에 설정된 hint bit를 디스크에서 볼 수 있다 (PG hot standby와 동일한 이유).
+  - hint bit는 shared lock 아래에서 설정하지 않는다. exclusive lock을 얻은 경우(try_write 성공, 페이지 수정 중, vacuum)에만 설정한다.
+    근거: Rust 메모리 모델에서 shared lock 아래의 동시 쓰기는 다른 읽기(flush 복사 포함)와 data race가 된다. hint bit는 선택적 정보이므로 기회가 있을 때만 설정해도 정합성에 영향이 없다. 대신 CLOG 조회가 늘어난다.
 - 파일 접근은 trait으로 추상화한다.
   근거: 로컬 디렉토리, 클러스터 파일시스템, 블록 디바이스 직접 관리 등으로 교체할 수 있게 하기 위함.
   - 모든 쓰기 연산은 fencing 토큰(epoch)을 인자로 받는다. single 모드 구현은 무시하고, ha 모드 구현은 쓰기 직전에 검사한다.
@@ -291,9 +307,6 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 내 답에 대해 impact_review_protocol에 따라 검토하라. 확정되면 decisions로 옮긴다.
 
 [답변했으나 검토 조건에 대한 확인 대기]
-- NUMERIC 타입 추가 여부와 시점. (답변: 바로)
-  검토: 조건부 진행. 3단계 튜플 포맷에서 가변 길이 타입을 일반화해 두고, NUMERIC 자체는 PG처럼 base-10000 digit 배열로 9단계 이후 구현.
-  rust_decimal은 28자리 제한으로 PG와 결과가 달라 sqllogictest 비교가 깨진다.
 - FK의 CASCADE / SET NULL 추가 시점. (답변: 바로)
   검토: 조건부 진행. decisions의 "NO ACTION/RESTRICT만"과 충돌하므로 확정 시 decisions도 수정해야 함.
   선행 조건: deadlock 처리, 잠금 테이블 상한 정책(둘 다 r2에서 확정). 11단계 안에서 NO ACTION 완성 후 추가.
@@ -301,7 +314,7 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - pg_catalog 호환 범위. (답변: 기본)
   제안: "psql 접속 + 단순 쿼리 + JDBC/psycopg 접속 성공"을 1차 범위로, psql \d는 2차.
   내부 카탈로그는 자체 구조, pg_catalog는 그 위의 뷰.
-  타입 OID는 PG 값으로 고정 (bool=16, int8=20, int4=23, text=25, float8=701, varchar=1043, timestamp=1114, numeric=1700). 3단계 전 확정 필요 (RowDescription에 실림).
+  (타입 OID 고정은 r4에서 decisions로 이동)
 - 관측성. (요청: 추천)
   제안: 로그 우선. tracing 크레이트로 1단계부터 구조화 로그(세션 ID, xid, LSN 필드).
   통계 뷰(pg_stat_activity, pg_stat_user_tables, pg_locks)는 12단계 통계 수집 시 함께 노출.

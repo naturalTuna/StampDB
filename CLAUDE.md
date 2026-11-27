@@ -9,7 +9,7 @@ Rust로 구현하는 학습용 OLTP 데이터베이스. PostgreSQL 와이어 프
 - `DESIGN.md`의 decisions, ha_and_backup_design, open_questions는 사용자가 명시적으로 지시할 때만 수정한다.
 
 ## 현재 단계
-- 1단계 2번: 버퍼 풀 (clock-sweep, PageGuard, flush 허용 훅)
+- 1단계 3번: Heap 파일 + 튜플 포맷 (64비트 xmin/xmax, null bitmap, hint bit, 가변 길이 타입, 데이터 타입 직렬화)
   (단계가 끝나면 사용자가 이 줄을 갱신한다)
 
 ## 작업 방식
