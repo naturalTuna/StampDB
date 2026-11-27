@@ -139,6 +139,32 @@ impl HeapFile {
         Ok(new_tid)
     }
 
+    /// Sets hint bits on the tuple at `tid` if the page's exclusive lock is
+    /// free right now. Returns whether the bits are now set; `false` means
+    /// the attempt was skipped (hint bits are optional, so this is safe).
+    ///
+    /// The caller is responsible for the hint bit policy, e.g. setting
+    /// `XMIN_COMMITTED` only after the commit record is flushed.
+    pub fn set_hint_bits(&self, tid: Tid, bits: u16) -> Result<bool> {
+        let pin = self.pool.fetch(self.tag(tid.blk))?;
+        let Some(mut page) = pin.try_write() else {
+            return Ok(false);
+        };
+        if is_new_page(&page) {
+            return Err(HeapError::TupleNotFound { tid });
+        }
+        let mut p = SlottedPage::open(&mut page[..])?;
+        let item = p
+            .get_item_mut(tid.slot)
+            .ok_or(HeapError::TupleNotFound { tid })?;
+        let before = TupleHeader::decode(item)?.infomask;
+        tuple::set_hint_bits(item, bits)?;
+        if before | bits != before {
+            page.mark_dirty_hint();
+        }
+        Ok(true)
+    }
+
     /// Sequential scan over the blocks that exist now.
     pub fn scan(&self) -> Result<HeapScan<'_>> {
         Ok(HeapScan {
@@ -480,6 +506,58 @@ mod tests {
         assert_eq!(ids.len(), 2000);
         assert!((0..4).all(|t| (0..500).all(|i| ids.contains(&(t * 1000 + i)))));
         pool.flush_all().unwrap();
+    }
+
+    #[test]
+    fn hint_bits_set_when_lock_is_free() {
+        use crate::access::tuple::infomask;
+        let (pool, heap) = setup(2);
+        let tid = heap.insert(&row(1, "h")).unwrap();
+        pool.flush_all().unwrap();
+        let tag = BufferTag {
+            rel: REL,
+            blk: tid.blk,
+        };
+
+        assert!(heap.set_hint_bits(tid, infomask::XMIN_COMMITTED).unwrap());
+        let h = TupleHeader::decode(&heap.fetch(tid).unwrap().unwrap()).unwrap();
+        assert_ne!(h.infomask & infomask::XMIN_COMMITTED, 0);
+        assert_eq!(pool.is_dirty(tag), Some(true));
+
+        // Setting bits that are already set does not dirty the page.
+        pool.flush_all().unwrap();
+        assert!(heap.set_hint_bits(tid, infomask::XMIN_COMMITTED).unwrap());
+        assert_eq!(pool.is_dirty(tag), Some(false));
+    }
+
+    #[test]
+    fn hint_bits_skipped_under_shared_lock() {
+        use crate::access::tuple::infomask;
+        let (pool, heap) = setup(2);
+        let tid = heap.insert(&row(1, "h")).unwrap();
+        let tag = BufferTag {
+            rel: REL,
+            blk: tid.blk,
+        };
+        let pin = pool.fetch(tag).unwrap();
+        let reader = pin.read();
+        assert!(pin.try_write().is_none());
+        assert!(!heap.set_hint_bits(tid, infomask::XMAX_INVALID).unwrap());
+        drop(reader);
+
+        assert!(heap.set_hint_bits(tid, infomask::XMIN_INVALID).unwrap());
+        assert!(matches!(
+            heap.set_hint_bits(tid, infomask::HAS_NULL),
+            Err(HeapError::Tuple(TupleError::Corrupt(_)))
+        ));
+        let missing = Tid {
+            blk: tid.blk,
+            slot: SlotId(5),
+        };
+        assert!(matches!(
+            heap.set_hint_bits(missing, infomask::XMIN_COMMITTED),
+            Err(HeapError::TupleNotFound { .. })
+        ));
     }
 
     #[test]

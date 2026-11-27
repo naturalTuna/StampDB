@@ -47,6 +47,18 @@ impl<'a> PinGuard<'a> {
             frame,
         }
     }
+
+    /// Takes the exclusive content lock only if it is free right now.
+    ///
+    /// Used for optional work such as setting hint bits, which is skipped
+    /// rather than waited for.
+    pub fn try_write(&self) -> Option<PageMut<'_>> {
+        let frame = self.pool.frame(self.fid);
+        frame
+            .content
+            .try_write()
+            .map(|guard| PageMut { guard, frame })
+    }
 }
 
 impl Drop for PinGuard<'_> {
@@ -81,6 +93,16 @@ impl PageMut<'_> {
     /// (PostgreSQL's `MarkBufferDirty`).
     pub fn mark_dirty(&self) {
         // Latch order: content lock (held) -> header lock.
+        self.frame.hdr.lock().dirty = true;
+    }
+
+    /// Marks the page dirty because only hint bits changed
+    /// (PostgreSQL's `MarkBufferDirtyHint`).
+    ///
+    /// Kept separate from [`PageMut::mark_dirty`] because the WAL step hooks
+    /// here: the first hint change after a checkpoint must log a full page
+    /// image, so a torn write of a hint-only change stays recoverable.
+    pub fn mark_dirty_hint(&self) {
         self.frame.hdr.lock().dirty = true;
     }
 }
