@@ -54,6 +54,12 @@ pub enum CatalogError {
     #[error("relation \"{0}\" does not exist")]
     UndefinedRelation(String),
 
+    #[error("duplicate key value violates unique constraint \"{0}\"")]
+    UniqueViolation(String),
+
+    #[error("column \"{0}\" does not exist")]
+    UndefinedColumn(String),
+
     #[error("corrupt catalog: {0}")]
     Corrupt(&'static str),
 }
@@ -99,6 +105,7 @@ impl RelationInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexInfo {
     pub oid: u32,
+    pub name: String,
     pub rel: RelFileId,
     pub table: u32,
     /// Indexed columns of the table, 1-based.
@@ -440,6 +447,198 @@ impl Catalog {
         Ok(())
     }
 
+    /// Creates index `name` on table `table` over `columns` within `txn`,
+    /// indexing the table's existing rows. Takes a Share lock on the table
+    /// (writers wait; DESIGN r10). A unique index fails on duplicate data.
+    pub fn create_index(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        table: &str,
+        columns: &[&str],
+        unique: bool,
+    ) -> Result<IndexInfo> {
+        let t = self
+            .lookup_relation(txn, table)?
+            .filter(|r| r.kind == RelKind::Table)
+            .ok_or_else(|| CatalogError::UndefinedRelation(table.to_owned()))?;
+        txn.lock_relation(RelFileId(t.oid), LockMode::Share)?;
+        txn.statement_snapshot();
+        let t = self
+            .lookup_relation(txn, table)?
+            .filter(|r| r.kind == RelKind::Table && r.oid == t.oid)
+            .ok_or_else(|| CatalogError::UndefinedRelation(table.to_owned()))?;
+        let attnums = columns
+            .iter()
+            .map(|c| {
+                t.columns
+                    .iter()
+                    .position(|col| col.name == *c)
+                    .map(|i| (i + 1) as u16)
+                    .ok_or_else(|| CatalogError::UndefinedColumn((*c).to_owned()))
+            })
+            .collect::<Result<Vec<u16>>>()?;
+
+        txn.write_xid()?;
+        let oid = self.engine.allocate_oid()?;
+        let rel = RelFileId(oid);
+        self.insert_row_checked(
+            txn,
+            SYS_CLASS,
+            &class_row(oid, name, RELKIND_INDEX, rel, attnums.len()),
+            name,
+        )?;
+        self.insert_row_checked(
+            txn,
+            SYS_INDEX,
+            &index_row(oid, t.oid, &attnums, unique, false),
+            name,
+        )?;
+        self.engine.create_relation(rel)?;
+        txn.drop_on_abort(rel);
+        let tree = BTree::create(rel, self.engine.pool().clone())?;
+        let info = IndexInfo {
+            oid,
+            name: name.to_owned(),
+            rel,
+            table: t.oid,
+            columns: attnums,
+            unique,
+            primary: false,
+        };
+
+        // Index every version some snapshot may still see.
+        let heap = HeapFile::open(t.rel, self.engine.pool().clone())?;
+        let horizon = txn.tm().oldest_xmin();
+        let desc = t.desc();
+        for blk in 0..heap.nblocks()? {
+            for (tid, tuple) in heap.page_tuples(crate::storage::page::BlockNumber(blk))? {
+                let h =
+                    crate::access::tuple::TupleHeader::decode(&tuple).map_err(HeapError::from)?;
+                if crate::access::heap::satisfies_vacuum(&h, horizon, txn.tm())?
+                    == crate::access::heap::VacuumState::Dead
+                {
+                    continue;
+                }
+                let row = deform_tuple(&desc, &tuple)?;
+                self.insert_entry(txn, &t, &info, &tree, &heap, &row, tid)?;
+            }
+        }
+        txn.next_command();
+        Ok(info)
+    }
+
+    /// Drops index `name` within `txn` (file deleted at commit).
+    pub fn drop_index(&self, txn: &mut Transaction, name: &str) -> Result<()> {
+        let idx = self
+            .lookup_relation(txn, name)?
+            .filter(|r| r.kind == RelKind::Index)
+            .ok_or_else(|| CatalogError::UndefinedRelation(name.to_owned()))?;
+        let table = self
+            .index_table(txn, idx.oid)?
+            .ok_or(CatalogError::Corrupt("index without sys_index row"))?;
+        txn.lock_relation(RelFileId(table), LockMode::AccessExclusive)?;
+        self.drop_index_rows(txn, idx.oid)?;
+        txn.drop_on_commit(idx.rel);
+        txn.next_command();
+        Ok(())
+    }
+
+    /// The table an index belongs to.
+    fn index_table(&self, txn: &mut Transaction, index_oid: u32) -> Result<Option<u32>> {
+        let snap = txn.snapshot();
+        let me = Me {
+            xid: txn.xid(),
+            cid: txn.command_id(),
+        };
+        for r in self.heap(SYS_INDEX)?.scan_mvcc(snap, me, txn.tm())? {
+            let row = deform_tuple(&index_desc(), &r?.1)?;
+            if int(&row, 0)? == i64::from(index_oid) {
+                return Ok(Some(int(&row, 1)? as u32));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Encodes `idx`'s key for a row of `table`.
+    pub fn index_key(table: &RelationInfo, idx: &IndexInfo, row: &[Value]) -> Result<Vec<u8>> {
+        let mut types = Vec::with_capacity(idx.columns.len());
+        let mut values = Vec::with_capacity(idx.columns.len());
+        for &c in &idx.columns {
+            let i = usize::from(c) - 1;
+            types.push(
+                table
+                    .columns
+                    .get(i)
+                    .ok_or(CatalogError::Corrupt("indkey out of range"))?
+                    .ty,
+            );
+            values.push(
+                row.get(i)
+                    .cloned()
+                    .ok_or(CatalogError::Corrupt("row too short"))?,
+            );
+        }
+        let mut k = Vec::new();
+        encode_key(&types, &values, &mut k)?;
+        Ok(k)
+    }
+
+    /// Adds the index entries for a row just inserted at `tid` into
+    /// `table`, enforcing unique indexes (for the executor's INSERT and
+    /// UPDATE). On a violation the transaction must be aborted.
+    pub fn insert_index_entries(
+        &self,
+        txn: &mut Transaction,
+        table: &RelationInfo,
+        row: &[Value],
+        tid: Tid,
+    ) -> Result<()> {
+        let heap = HeapFile::open(table.rel, self.engine.pool().clone())?;
+        for idx in self.indexes_of(txn, table.oid)? {
+            let tree = BTree::open(idx.rel, self.engine.pool().clone())?;
+            self.insert_entry(txn, table, &idx, &tree, &heap, row, tid)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_entry(
+        &self,
+        txn: &mut Transaction,
+        table: &RelationInfo,
+        idx: &IndexInfo,
+        tree: &BTree,
+        heap: &HeapFile,
+        row: &[Value],
+        tid: Tid,
+    ) -> Result<()> {
+        let key = Self::index_key(table, idx, row)?;
+        // NULLs never conflict in a unique index (as in PostgreSQL).
+        let has_null = idx
+            .columns
+            .iter()
+            .any(|&c| row.get(usize::from(c) - 1).is_some_and(Value::is_null));
+        if !idx.unique || has_null {
+            tree.insert(&key, tid)?;
+            return Ok(());
+        }
+        let xid = txn.write_xid()?;
+        loop {
+            let check = |t| {
+                heap.unique_check(t, Some(xid), txn.tm())
+                    .map_err(|e| BTreeError::External(Box::new(e)))
+            };
+            match tree.insert_unique(&key, tid, &check)? {
+                InsertOutcome::Inserted => return Ok(()),
+                InsertOutcome::Duplicate => {
+                    return Err(CatalogError::UniqueViolation(idx.name.clone()));
+                }
+                InsertOutcome::Wait(x) => txn.wait_for(x)?,
+            }
+        }
+    }
+
     /// Deletes the sys_index and sys_class rows of index `oid`.
     fn drop_index_rows(&self, txn: &mut Transaction, oid: u32) -> Result<()> {
         let v = Value::Int8(i64::from(oid));
@@ -558,11 +757,11 @@ impl Catalog {
             let oid = int(&r, 0)? as u32;
             let rel = self
                 .lookup_oid(txn, oid)?
-                .map(|i| i.rel)
                 .ok_or(CatalogError::Corrupt("index without sys_class row"))?;
             out.push(IndexInfo {
                 oid,
-                rel,
+                name: rel.name,
+                rel: rel.rel,
                 table: int(&r, 1)? as u32,
                 columns: parse_indkey(&text(&r, 2)?)?,
                 unique: boolean(&r, 3)?,

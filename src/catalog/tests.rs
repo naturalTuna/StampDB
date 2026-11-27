@@ -4,6 +4,7 @@ use crate::lock::{LockManager, WaitPolicy};
 use crate::storage::backend::FenceToken;
 use crate::storage::mem::MemBackend;
 use crate::txn::{Isolation, TransactionManager};
+use std::ops::Bound;
 
 const FENCE: FenceToken = FenceToken::new(1);
 
@@ -294,4 +295,201 @@ fn ddl_after_crash() {
     let mut t = e.begin();
     e.cat.create_table(&mut t, "lost", &cols()).unwrap();
     t.commit().unwrap();
+}
+
+fn people() -> Vec<Column> {
+    vec![
+        Column {
+            name: "id".into(),
+            ty: DataType::Int4,
+            not_null: true,
+        },
+        Column {
+            name: "email".into(),
+            ty: DataType::Text,
+            not_null: false,
+        },
+    ]
+}
+
+/// Inserts a row into `table` and its indexes.
+fn put(
+    e: &Env,
+    t: &mut Transaction,
+    table: &RelationInfo,
+    id: i32,
+    email: Option<&str>,
+) -> Result<Tid> {
+    let xid = t.write_xid()?;
+    let row = vec![
+        Value::Int4(id),
+        email.map_or(Value::Null, |s| Value::Text(s.into())),
+    ];
+    let tuple = form_tuple(&table.desc(), &row, xid, t.command_id())?;
+    let heap = HeapFile::open(table.rel, e.cat.engine().pool().clone())?;
+    let tid = heap.insert(&tuple)?;
+    e.cat.insert_index_entries(t, table, &row, tid)?;
+    Ok(tid)
+}
+
+fn index_entries(e: &Env, idx: &IndexInfo) -> usize {
+    BTree::open(idx.rel, e.cat.engine().pool().clone())
+        .unwrap()
+        .scan(Bound::Unbounded, Bound::Unbounded)
+        .unwrap()
+        .count()
+}
+
+#[test]
+fn create_index_indexes_existing_rows() {
+    let e = fresh();
+    let mut t = e.begin();
+    let tab = e.cat.create_table(&mut t, "people", &people()).unwrap();
+    for i in 0..300 {
+        put(&e, &mut t, &tab, i, Some(&format!("u{i}@x"))).unwrap();
+    }
+    t.commit().unwrap();
+    let mut t = e.begin();
+    let idx = e
+        .cat
+        .create_index(&mut t, "people_email", "people", &["email"], false)
+        .unwrap();
+    t.commit().unwrap();
+    assert_eq!(index_entries(&e, &idx), 300);
+    let mut r = e.begin();
+    let found = e.cat.indexes_of(&mut r, tab.oid).unwrap();
+    assert_eq!(found, vec![idx]);
+    assert!(matches!(
+        e.cat
+            .create_index(&mut r, "bad", "people", &["nope"], false),
+        Err(CatalogError::UndefinedColumn(_))
+    ));
+}
+
+#[test]
+fn unique_indexes_reject_duplicates() {
+    let e = fresh();
+    let mut t = e.begin();
+    let tab = e.cat.create_table(&mut t, "people", &people()).unwrap();
+    put(&e, &mut t, &tab, 1, Some("a@x")).unwrap();
+    put(&e, &mut t, &tab, 2, Some("a@x")).unwrap();
+    t.commit().unwrap();
+
+    // Building over duplicate data fails, and leaves nothing behind.
+    let mut t = e.begin();
+    assert!(matches!(
+        e.cat.create_index(&mut t, "people_email_key", "people", &["email"], true),
+        Err(CatalogError::UniqueViolation(n)) if n == "people_email_key"
+    ));
+    t.abort().unwrap();
+    let mut r = e.begin();
+    assert!(
+        e.cat
+            .lookup_relation(&mut r, "people_email_key")
+            .unwrap()
+            .is_none()
+    );
+    drop(r);
+
+    let mut t = e.begin();
+    let idx = e
+        .cat
+        .create_index(&mut t, "people_id_key", "people", &["id"], true)
+        .unwrap();
+    t.commit().unwrap();
+
+    let mut t = e.begin();
+    let dup = put(&e, &mut t, &tab, 1, Some("b@x"));
+    assert!(matches!(dup, Err(CatalogError::UniqueViolation(n)) if n == "people_id_key"));
+    t.abort().unwrap();
+
+    // NULLs never conflict; a deleted (committed) row frees its key.
+    let mut t = e.begin();
+    let heap = HeapFile::open(tab.rel, e.cat.engine().pool().clone()).unwrap();
+    let mut snap_t = e.begin();
+    let me = Me {
+        xid: None,
+        cid: snap_t.command_id(),
+    };
+    let snap = snap_t.snapshot();
+    let first = heap
+        .scan_mvcc(snap, me, snap_t.tm())
+        .unwrap()
+        .map(|r| r.unwrap())
+        .find(|(_, row)| deform_tuple(&tab.desc(), row).unwrap()[0] == Value::Int4(1))
+        .unwrap()
+        .0;
+    drop(snap_t);
+    heap.delete_mvcc(first, &mut t).unwrap();
+    t.commit().unwrap();
+    let mut t = e.begin();
+    put(&e, &mut t, &tab, 1, None).unwrap();
+    t.commit().unwrap();
+    assert_eq!(
+        index_entries(&e, &idx),
+        3,
+        "old dead entry stays until vacuum"
+    );
+}
+
+#[test]
+fn drop_table_drops_its_indexes_and_drop_index_works() {
+    let e = fresh();
+    let mut t = e.begin();
+    let tab = e.cat.create_table(&mut t, "people", &people()).unwrap();
+    let i1 = e
+        .cat
+        .create_index(&mut t, "p_id", "people", &["id"], true)
+        .unwrap();
+    let i2 = e
+        .cat
+        .create_index(&mut t, "p_email", "people", &["email"], false)
+        .unwrap();
+    t.commit().unwrap();
+
+    let mut t = e.begin();
+    e.cat.drop_index(&mut t, "p_email").unwrap();
+    t.commit().unwrap();
+    assert!(!file_exists(&e, i2.rel));
+    let mut r = e.begin();
+    assert_eq!(e.cat.indexes_of(&mut r, tab.oid).unwrap(), vec![i1.clone()]);
+    drop(r);
+
+    let mut t = e.begin();
+    e.cat.drop_table(&mut t, "people").unwrap();
+    t.commit().unwrap();
+    assert!(!file_exists(&e, tab.rel) && !file_exists(&e, i1.rel));
+    let mut r = e.begin();
+    assert!(e.cat.lookup_relation(&mut r, "p_id").unwrap().is_none());
+}
+
+#[test]
+fn create_index_waits_for_writers() {
+    let e = fresh();
+    let mut t = e.begin();
+    let tab = e.cat.create_table(&mut t, "w", &people()).unwrap();
+    t.commit().unwrap();
+    let mut writer = e.begin();
+    writer
+        .lock_relation(RelFileId(tab.oid), LockMode::RowExclusive)
+        .unwrap();
+    put(&e, &mut writer, &tab, 7, Some("w@x")).unwrap();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let idx = std::thread::scope(|s| {
+        let h = s.spawn(|| {
+            let mut t = e.begin();
+            let idx = e
+                .cat
+                .create_index(&mut t, "w_id", "w", &["id"], true)
+                .unwrap();
+            t.commit().unwrap();
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            idx
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!done.load(std::sync::atomic::Ordering::SeqCst));
+        writer.commit().unwrap();
+        h.join().unwrap()
+    });
+    assert_eq!(index_entries(&e, &idx), 1, "the committed row is indexed");
 }

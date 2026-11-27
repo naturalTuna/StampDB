@@ -678,6 +678,12 @@ impl HeapFile {
         BufferTag { rel: self.rel, blk }
     }
 
+    /// Every tuple version on block `blk`, regardless of visibility (for
+    /// index builds).
+    pub fn page_tuples(&self, blk: BlockNumber) -> Result<Vec<(Tid, Vec<u8>)>> {
+        self.read_page(blk)
+    }
+
     /// Copies the tuples of one page under its shared lock.
     fn read_page(&self, blk: BlockNumber) -> Result<Vec<(Tid, Vec<u8>)>> {
         let pin = self.pool.fetch(self.tag(blk))?;
