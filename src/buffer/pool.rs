@@ -252,6 +252,11 @@ impl BufferPool {
         res
     }
 
+    /// Number of blocks in `rel` on disk (extended blocks included).
+    pub fn nblocks(&self, rel: RelFileId) -> Result<u32> {
+        Ok(self.disk.nblocks(rel)?)
+    }
+
     /// Pin count of a resident page (diagnostics and tests).
     pub fn pin_count(&self, tag: BufferTag) -> Option<u32> {
         self.with_resident_header(tag, |h| h.pin_count)
