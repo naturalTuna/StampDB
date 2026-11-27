@@ -816,6 +816,150 @@ mod tests {
         assert!(ids(Bound::Excluded(k(99)), Bound::Unbounded).is_empty());
     }
 
+    // ---- concurrency ----
+
+    use crate::buffer::BufferError;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Height the concurrency tests stay within (asserted at the end).
+    const MAX_HEIGHT: usize = 4;
+    /// An insert pins its split path: about two pages per level, plus the
+    /// old right sibling and the metapage/new root at a root split.
+    const MAX_PINS_PER_THREAD: usize = 2 * MAX_HEIGHT + 2;
+    const SLACK: usize = 4;
+
+    fn concurrent_setup(threads: usize) -> (Arc<BufferPool>, BTree) {
+        let mem = Arc::new(MemBackend::default());
+        let pool = pool_over(&mem, threads * MAX_PINS_PER_THREAD + SLACK);
+        DiskManager::new(mem.clone())
+            .create_relation(REL, FENCE)
+            .unwrap();
+        let tree = BTree::create(REL, pool.clone()).unwrap();
+        (pool, tree)
+    }
+
+    fn fail_on_exhausted<T>(r: Result<T>, what: &str) -> T {
+        match r {
+            Ok(v) => v,
+            Err(BTreeError::Buffer(BufferError::Exhausted)) => {
+                panic!("{what}: Exhausted with a pool sized for the test's concurrency")
+            }
+            Err(e) => panic!("{what}: {e}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_inserts_and_scans() {
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 1500;
+        const PAD: usize = 200;
+        let (pool, tree) = concurrent_setup(THREADS + 1);
+        let progress: Vec<AtomicUsize> = (0..THREADS).map(|_| AtomicUsize::new(0)).collect();
+        let done = AtomicBool::new(false);
+        // Interleaved ids make every writer hit the right edge of the tree.
+        let id = |t: usize, i: usize| (i * THREADS + t) as i64;
+
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let (tree, progress) = (&tree, &progress);
+                s.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        fail_on_exhausted(
+                            tree.insert(&key(id(t, i), PAD), tid(i as u32)),
+                            "insert",
+                        );
+                        progress[t].store(i + 1, Ordering::SeqCst);
+                    }
+                });
+            }
+            s.spawn(|| {
+                let mut last_len = 0;
+                let mut scans = 0;
+                while !done.load(Ordering::SeqCst) || scans < 3 {
+                    let before: Vec<usize> =
+                        progress.iter().map(|p| p.load(Ordering::SeqCst)).collect();
+                    let got: Vec<(Vec<u8>, Tid)> = fail_on_exhausted(
+                        tree.scan(Bound::Unbounded, Bound::Unbounded)
+                            .and_then(|sc| sc.collect::<Result<_>>()),
+                        "scan",
+                    );
+                    assert!(got.windows(2).all(|w| w[0] < w[1]), "sorted, no duplicates");
+                    assert!(got.len() >= last_len, "an entry disappeared");
+                    last_len = got.len();
+                    let present: BTreeSet<&Vec<u8>> = got.iter().map(|(k, _)| k).collect();
+                    for (t, &p) in before.iter().enumerate() {
+                        for i in 0..p {
+                            assert!(
+                                present.contains(&key(id(t, i), PAD)),
+                                "insert completed before the scan is missing"
+                            );
+                        }
+                    }
+                    scans += 1;
+                }
+            });
+            // Writers are joined when the scope ends; signal the scanner
+            // once they have all finished.
+            s.spawn(|| {
+                while progress
+                    .iter()
+                    .any(|p| p.load(Ordering::SeqCst) < PER_THREAD)
+                {
+                    std::thread::yield_now();
+                }
+                done.store(true, Ordering::SeqCst);
+            });
+        });
+
+        let height = tree.height().unwrap() as usize;
+        assert!((2..=MAX_HEIGHT).contains(&height), "height {height}");
+        assert!(
+            pool.nblocks(REL).unwrap() as usize > pool.capacity() * 2,
+            "eviction exercised"
+        );
+        let entries = check_invariants(&tree);
+        assert_eq!(entries.len(), THREADS * PER_THREAD);
+        let expected: BTreeSet<(Vec<u8>, Tid)> = (0..THREADS)
+            .flat_map(|t| (0..PER_THREAD).map(move |i| (key(id(t, i), PAD), tid(i as u32))))
+            .collect();
+        assert_eq!(all(&tree), expected.into_iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn concurrent_inserts_and_deletes() {
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 1000;
+        let (_pool, tree) = concurrent_setup(THREADS);
+        // Thread t owns ids with id % THREADS == t; it inserts all of them in
+        // a scattered order and deletes every third one afterwards.
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let tree = &tree;
+                s.spawn(move || {
+                    let ids: Vec<i64> = (0..PER_THREAD)
+                        .map(|i| ((i * 7919) % PER_THREAD * THREADS + t) as i64)
+                        .collect();
+                    for &k in &ids {
+                        fail_on_exhausted(tree.insert(&key(k, 150), tid(t as u32)), "insert");
+                    }
+                    for &k in ids.iter().filter(|&&k| k % 3 == 0) {
+                        assert!(fail_on_exhausted(
+                            tree.delete(&key(k, 150), tid(t as u32)),
+                            "delete"
+                        ));
+                    }
+                });
+            }
+        });
+        let expected: BTreeSet<(Vec<u8>, Tid)> = (0..THREADS * PER_THREAD)
+            .filter(|k| k % 3 != 0)
+            .map(|k| (key(k as i64, 150), tid((k % THREADS) as u32)))
+            .collect();
+        assert!(tree.height().unwrap() as usize <= MAX_HEIGHT);
+        assert_eq!(check_invariants(&tree).len(), expected.len());
+        assert_eq!(all(&tree), expected.into_iter().collect::<Vec<_>>());
+    }
+
     fn in_range(k: &[u8], lo: &Bound<Vec<u8>>, hi: &Bound<Vec<u8>>) -> bool {
         (match lo {
             Bound::Included(b) => k >= b.as_slice(),
