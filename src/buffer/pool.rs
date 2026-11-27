@@ -5,7 +5,7 @@
 //! kept on a free list. When it is empty, clock-sweep picks a victim: an
 //! unpinned frame whose usage count has decayed to zero.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,6 +42,24 @@ pub enum FlushOutcome {
     Clean,
     /// [`FlushControl::may_flush`] refused; the page stays dirty.
     Deferred,
+}
+
+/// Counts from a bulk flush.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlushStats {
+    /// Pages written.
+    pub written: usize,
+    /// Dirty pages that [`FlushControl::may_flush`] refused.
+    pub deferred: usize,
+}
+
+/// How a newly mapped frame gets its contents.
+#[derive(Debug, Clone, Copy)]
+enum Fill {
+    /// Read the page from disk (and verify it).
+    Read,
+    /// Zero-fill; the block was just appended as an all-zero page.
+    Zero,
 }
 
 /// Index of a frame in the pool.
@@ -131,6 +149,73 @@ impl BufferPool {
 
     /// Pins the page `tag`, reading it from disk if it is not resident.
     pub fn fetch(&self, tag: BufferTag) -> Result<PinGuard<'_>> {
+        self.pin_or_load(tag, Fill::Read)
+    }
+
+    /// Appends a new block to `rel` and returns it pinned.
+    ///
+    /// The block is written to disk as an all-zero page and the frame is
+    /// zero-filled without reading it back (PostgreSQL's
+    /// `ExtendBufferedRel`). The caller initializes the page and marks it
+    /// dirty.
+    pub fn extend(&self, rel: RelFileId) -> Result<(BlockNumber, PinGuard<'_>)> {
+        let blk = self.disk.extend(rel, self.control.fence_token())?;
+        let pin = self.pin_or_load(BufferTag { rel, blk }, Fill::Zero)?;
+        Ok((blk, pin))
+    }
+
+    /// Writes every dirty page of `rel` and syncs the file.
+    ///
+    /// Deferred pages are counted and stay dirty; the sync covers only what
+    /// was written.
+    pub fn flush_relation(&self, rel: RelFileId) -> Result<FlushStats> {
+        let (stats, _) = self.flush_matching(|t| t.rel == rel)?;
+        self.disk.sync_relation(rel)?;
+        Ok(stats)
+    }
+
+    /// Writes every dirty page in the pool and syncs the files written to.
+    pub fn flush_all(&self) -> Result<FlushStats> {
+        let (stats, written_rels) = self.flush_matching(|_| true)?;
+        for rel in written_rels {
+            self.disk.sync_relation(rel)?;
+        }
+        Ok(stats)
+    }
+
+    /// Discards all buffers of `rel` without writing them (for DROP TABLE;
+    /// PostgreSQL's `DropRelationBuffers`).
+    ///
+    /// The caller must ensure nobody else uses the relation. A pinned buffer
+    /// is an error; buffers dropped before it stay dropped.
+    pub fn drop_relation_buffers(&self, rel: RelFileId) -> Result<()> {
+        for i in 0..self.frames.len() {
+            let fid = FrameId(i);
+            let tag = match self.frame(fid).hdr.lock().tag {
+                Some(t) if t.rel == rel => t,
+                _ => continue,
+            };
+            let mut part = self.partition(tag).write();
+            let mut h = self.frame(fid).hdr.lock();
+            if h.tag != Some(tag) {
+                continue; // evicted meanwhile
+            }
+            if h.pin_count > 0 {
+                return Err(BufferError::Pinned {
+                    rel: tag.rel.0,
+                    blk: tag.blk.0,
+                });
+            }
+            part.remove(&tag);
+            *h = FrameHeader::default();
+            drop(h);
+            drop(part);
+            self.free_list.lock().push(fid);
+        }
+        Ok(())
+    }
+
+    fn pin_or_load(&self, tag: BufferTag, fill: Fill) -> Result<PinGuard<'_>> {
         loop {
             if let Some(fid) = self.pin_resident(tag, true) {
                 if self.wait_until_loaded(fid, tag) {
@@ -149,7 +234,7 @@ impl BufferPool {
                     continue;
                 }
             }
-            self.load(tag, fid)?;
+            self.load(tag, fid, fill)?;
             return Ok(PinGuard::new(self, fid, tag));
         }
     }
@@ -304,13 +389,19 @@ impl BufferPool {
         Replace::Installed
     }
 
-    /// Reads `tag` into the installed frame `fid`. On failure, unmaps the
-    /// frame, wakes waiters, and drops the caller's pin.
-    fn load(&self, tag: BufferTag, fid: FrameId) -> Result<()> {
+    /// Fills the installed frame `fid` with `tag`'s contents. On failure,
+    /// unmaps the frame, wakes waiters, and drops the caller's pin.
+    fn load(&self, tag: BufferTag, fid: FrameId, fill: Fill) -> Result<()> {
         let frame = self.frame(fid);
         let res = {
             let mut page = frame.content.write();
-            self.disk.read_page(tag.rel, tag.blk, &mut page)
+            match fill {
+                Fill::Read => self.disk.read_page(tag.rel, tag.blk, &mut page),
+                Fill::Zero => {
+                    page.fill(0);
+                    Ok(())
+                }
+            }
         };
         match res {
             Ok(()) => {
@@ -372,6 +463,47 @@ impl BufferPool {
             return Err(e.into());
         }
         Ok(FlushOutcome::Written)
+    }
+
+    /// Flushes dirty pages matching `pred`. Returns the counts and the
+    /// relations written to (which still need a sync).
+    fn flush_matching(
+        &self,
+        pred: impl Fn(&BufferTag) -> bool,
+    ) -> Result<(FlushStats, HashSet<RelFileId>)> {
+        let mut stats = FlushStats::default();
+        let mut rels = HashSet::new();
+        for i in 0..self.frames.len() {
+            let fid = FrameId(i);
+            let Some(tag) = self.pin_if(fid, &pred) else {
+                continue;
+            };
+            let res = self.flush_frame(fid);
+            self.unpin(fid);
+            match res? {
+                FlushOutcome::Written => {
+                    stats.written += 1;
+                    rels.insert(tag.rel);
+                }
+                FlushOutcome::Deferred => stats.deferred += 1,
+                FlushOutcome::Clean => {}
+            }
+        }
+        Ok((stats, rels))
+    }
+
+    /// Pins frame `fid` if it holds a dirty, valid page matching `pred`.
+    ///
+    /// Pinning under the header lock alone is safe: remapping requires the
+    /// remapper's own pin to be the only one (checked under the same lock).
+    fn pin_if(&self, fid: FrameId, pred: impl Fn(&BufferTag) -> bool) -> Option<BufferTag> {
+        let mut h = self.frame(fid).hdr.lock();
+        let tag = h.tag?;
+        if !(h.valid && h.dirty && pred(&tag)) {
+            return None;
+        }
+        h.pin_count += 1;
+        Some(tag)
     }
 
     fn with_resident_header<T>(
@@ -696,6 +828,124 @@ mod tests {
         disk.remove_relation(REL, FENCE).unwrap();
         assert!(pool.flush_page(tag(0)).is_err());
         assert_eq!(pool.is_dirty(tag(0)), Some(true));
+    }
+
+    const REL2: RelFileId = RelFileId(2);
+
+    fn tag2(blk: u32) -> BufferTag {
+        BufferTag {
+            rel: REL2,
+            blk: BlockNumber(blk),
+        }
+    }
+
+    #[test]
+    fn extend_returns_zeroed_pinned_page_without_read() {
+        let (mem, disk, pool) = setup_with(2, 1, Arc::new(SingleModeFlush::new(FENCE)));
+        let reads = mem.reads();
+        let (blk, pin) = pool.extend(REL).unwrap();
+        assert_eq!(blk, BlockNumber(1));
+        assert_eq!(disk.nblocks(REL).unwrap(), 2);
+        assert!(page::is_new_page(&pin.read()));
+        assert_eq!(pool.pin_count(tag(1)), Some(1));
+        assert_eq!(pool.is_dirty(tag(1)), Some(false));
+        assert_eq!(mem.reads(), reads, "extend must not read the block");
+
+        {
+            let mut w = pin.write();
+            let mut p = SlottedPage::init(&mut w[..], PageKind::Heap, 0).unwrap();
+            p.add_item(b"new row").unwrap().unwrap();
+            w.mark_dirty();
+        }
+        drop(pin);
+        assert_eq!(pool.flush_page(tag(1)).unwrap(), FlushOutcome::Written);
+        let disk_page = on_disk(&mem, 1);
+        verify_checksum(&disk_page, BlockNumber(1)).unwrap();
+        assert_eq!(item(&disk_page), b"new row");
+    }
+
+    #[test]
+    fn extend_uses_fence_token() {
+        let (mem, _disk, pool) = setup_with(2, 0, gate(true, 7));
+        let before = mem.fences().len();
+        let (_blk, _pin) = pool.extend(REL).unwrap();
+        assert_eq!(mem.fences()[before..], [FenceToken::new(7)]);
+    }
+
+    #[test]
+    fn flush_relation_writes_only_that_relation() {
+        let (mem, disk, pool) = setup_with(4, 2, Arc::new(SingleModeFlush::new(FENCE)));
+        disk.create_relation(REL2, FENCE).unwrap();
+        let (_b, pin) = pool.extend(REL2).unwrap();
+        SlottedPage::init(&mut pin.write()[..], PageKind::Heap, 0).unwrap();
+        pin.write().mark_dirty();
+        drop(pin);
+        modify(&pool, 0, 9);
+        modify(&pool, 1, 9);
+
+        let stats = pool.flush_relation(REL).unwrap();
+        assert_eq!(
+            stats,
+            FlushStats {
+                written: 2,
+                deferred: 0
+            }
+        );
+        assert_eq!(pool.is_dirty(tag(0)), Some(false));
+        assert_eq!(pool.is_dirty(tag2(0)), Some(true));
+        assert_eq!(item(&on_disk(&mem, 1))[0], 9);
+
+        let stats = pool.flush_all().unwrap();
+        assert_eq!(stats.written, 1);
+        assert_eq!(pool.is_dirty(tag2(0)), Some(false));
+        assert_eq!(pool.flush_all().unwrap(), FlushStats::default());
+    }
+
+    #[test]
+    fn bulk_flush_counts_deferred_pages() {
+        let g = gate(false, 1);
+        let (_mem, _disk, pool) = setup_with(4, 3, g.clone());
+        for b in 0..3 {
+            modify(&pool, b, 1);
+        }
+        assert_eq!(
+            pool.flush_all().unwrap(),
+            FlushStats {
+                written: 0,
+                deferred: 3
+            }
+        );
+        g.allow.store(true, Ordering::SeqCst);
+        assert_eq!(pool.flush_relation(REL).unwrap().written, 3);
+    }
+
+    #[test]
+    fn drop_relation_buffers_discards_without_writing() {
+        let (mem, disk, pool) = setup_with(2, 2, Arc::new(SingleModeFlush::new(FENCE)));
+        modify(&pool, 0, 0xDD);
+        modify(&pool, 1, 0xDD);
+        let writes = mem.writes();
+
+        pool.drop_relation_buffers(REL).unwrap();
+        assert_eq!(pool.pin_count(tag(0)), None);
+        assert_eq!(pool.pin_count(tag(1)), None);
+
+        // Frames are reusable without evicting (and thus writing) anything.
+        disk.create_relation(REL2, FENCE).unwrap();
+        let _a = pool.extend(REL2).unwrap();
+        let _b = pool.extend(REL2).unwrap();
+        assert_eq!(mem.writes(), writes + 2, "only the two extend writes");
+        assert_ne!(item(&on_disk(&mem, 0))[0], 0xDD, "dirty data discarded");
+    }
+
+    #[test]
+    fn drop_relation_buffers_rejects_pinned() {
+        let (_mem, pool) = setup(2, 1);
+        let _pin = pool.fetch(tag(0)).unwrap();
+        assert!(matches!(
+            pool.drop_relation_buffers(REL),
+            Err(BufferError::Pinned { rel: 1, blk: 0 })
+        ));
     }
 
     #[test]
