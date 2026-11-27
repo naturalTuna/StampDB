@@ -434,6 +434,10 @@ fn coerce(b: BExpr, to: DataType, mode: Coercion) -> Result<Expr> {
             if !ok {
                 return Err(fail(&b));
             }
+            // Fold casts of constants (so the planner sees `col = const`).
+            if let Expr::Const(v) = b.expr {
+                return Ok(Expr::Const(cast(v, to, cast_mode)?));
+            }
             Ok(Expr::Cast {
                 arg: Box::new(b.expr),
                 to,

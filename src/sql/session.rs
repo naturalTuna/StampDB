@@ -138,6 +138,27 @@ impl Session {
         stmts.iter().map(|s| self.run(s)).collect()
     }
 
+    /// The optimized plan of one query or DML statement, bound in a
+    /// throwaway transaction (for EXPLAIN and tests).
+    pub fn plan(&mut self, sql: &str) -> Result<Plan> {
+        let stmts = parse(sql)?;
+        let [stmt] = stmts.as_slice() else {
+            return Err(SqlError::new(code::SYNTAX_ERROR, "expected one statement"));
+        };
+        let mut t = self.db.begin(self.default_isolation);
+        t.statement_snapshot();
+        let plan = match Binder::new(&self.db.catalog, &mut t).bind(stmt) {
+            Ok(Bound::Query { plan, .. }) => self.optimize(&mut t, plan),
+            Ok(Bound::Insert { source, .. }) => self.optimize(&mut t, source),
+            Ok(Bound::Update { scan, .. } | Bound::Delete { scan, .. }) => {
+                self.optimize(&mut t, scan)
+            }
+            Err(e) => Err(e),
+        };
+        t.abort()?;
+        plan
+    }
+
     /// Runs one statement.
     pub fn run(&mut self, stmt: &ast::Statement) -> Result<QueryResult> {
         let kind = match classify(stmt) {
@@ -365,6 +386,11 @@ impl Session {
         }
     }
 
+    fn optimize(&self, txn: &mut Transaction, plan: Plan) -> Result<Plan> {
+        let cat = &self.db.catalog;
+        planner::optimize(plan, &mut |t| Ok(cat.indexes_of(txn, t.oid)?))
+    }
+
     fn env(&self, txn: &mut Transaction) -> Arc<ExecEnv> {
         let tm: Arc<dyn TransactionManager> = self.db.engine().txn().clone();
         Arc::new(ExecEnv {
@@ -381,7 +407,7 @@ impl Session {
     fn execute_bound(&self, txn: &mut Transaction, bound: Bound) -> Result<QueryResult> {
         match bound {
             Bound::Query { plan, columns } => {
-                let plan = planner::optimize(plan)?;
+                let plan = self.optimize(txn, plan)?;
                 let env = self.env(txn);
                 let rows = exec::run(&plan, &env)?;
                 Ok(QueryResult {
@@ -392,7 +418,7 @@ impl Session {
                 })
             }
             Bound::Insert { table, source } => {
-                let plan = planner::optimize(source)?;
+                let plan = self.optimize(txn, source)?;
                 let env = self.env(txn);
                 let rows = exec::run(&plan, &env)?;
                 let cat = &self.db.catalog;
@@ -438,7 +464,7 @@ impl Session {
         scan: Plan,
         assignments: Option<&[(usize, Expr)]>,
     ) -> Result<u64> {
-        let plan = planner::optimize(scan)?;
+        let plan = self.optimize(txn, scan)?;
         let filter = match &plan {
             Plan::Scan { filter, .. } | Plan::IndexScan { filter, .. } => filter.clone(),
             _ => return Err(SqlError::internal("DML plan is not a scan")),

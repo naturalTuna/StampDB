@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use super::datum::format_value;
 use super::error::code;
+use super::plan;
 use super::*;
 use crate::buffer::SingleModeFlush;
 use crate::lock::WaitPolicy;
@@ -670,4 +671,180 @@ fn deadlocks_are_detected() {
     let errs: Vec<_> = [&ra, &rb].iter().filter_map(|r| r.as_ref().err()).collect();
     assert_eq!(errs.len(), 1, "{ra:?} {rb:?}");
     assert_eq!(errs[0].code, code::DEADLOCK_DETECTED);
+}
+
+/// Node names of a plan, depth first.
+fn nodes(p: &plan::Plan) -> Vec<String> {
+    use plan::Plan as P;
+    let (name, kids): (String, Vec<&P>) = match p {
+        P::Scan { table, .. } => (format!("Scan {}", table.name), vec![]),
+        P::IndexScan { index, .. } => (format!("IndexScan {}", index.name), vec![]),
+        P::Values { .. } => ("Values".into(), vec![]),
+        P::Filter { input, .. } => ("Filter".into(), vec![input]),
+        P::Project { input, .. } => ("Project".into(), vec![input]),
+        P::NestedLoop { left, right, .. } => ("NestedLoop".into(), vec![left, right]),
+        P::HashJoin { left, right, .. } => ("HashJoin".into(), vec![left, right]),
+        P::Aggregate { input, .. } => ("Aggregate".into(), vec![input]),
+        P::Sort { input, .. } => ("Sort".into(), vec![input]),
+        P::Distinct { input } => ("Distinct".into(), vec![input]),
+        P::Limit { input, .. } => ("Limit".into(), vec![input]),
+    };
+    let mut out = vec![name];
+    for k in kids {
+        out.extend(nodes(k));
+    }
+    out
+}
+
+fn plan_nodes(s: &mut Session, sql: &str) -> Vec<String> {
+    nodes(&s.plan(sql).unwrap_or_else(|e| panic!("{sql}: {e}")))
+}
+
+#[test]
+fn index_scans_are_chosen_and_agree_with_seq_scans() {
+    let db = db();
+    let mut s = db.session();
+    ok(&mut s, "CREATE TABLE t (a INT, b VARCHAR(4), c FLOAT8)");
+    for i in 0..300 {
+        let a = if i % 50 == 7 {
+            "NULL".to_owned()
+        } else {
+            (i % 100).to_string()
+        };
+        ok(
+            &mut s,
+            &format!(
+                "INSERT INTO t VALUES ({a}, '{}', {})",
+                ["x", "y", "zz"][i % 3],
+                i % 7
+            ),
+        );
+    }
+    ok(&mut s, "CREATE INDEX t_a ON t (a)");
+    ok(&mut s, "CREATE INDEX t_ba ON t (b, a)");
+    ok(&mut s, "CREATE INDEX t_c ON t (c)");
+
+    let cases = [
+        ("a = 5", "t_a"),
+        ("5 = a", "t_a"),
+        ("a < 3", "t_a"),
+        ("a >= 97", "t_a"),
+        ("a > 10 AND a <= 12", "t_a"),
+        ("b = 'y'", "t_ba"),
+        ("b = 'y' AND a = 4", "t_ba"),
+        ("b = 'zz' AND a > 95", "t_ba"),
+        ("b = 'zz' AND a < 2 AND c > 1", "t_ba"),
+        ("b = 'toolong'", "t_ba"),
+        ("c = 3", "t_c"),
+        ("c > 5.5", "t_c"),
+    ];
+    for (cond, index) in cases {
+        let sql = format!("SELECT a, b, c FROM t WHERE {cond} ORDER BY a, b, c");
+        let n = plan_nodes(&mut s, &sql);
+        assert!(n.contains(&format!("IndexScan {index}")), "{cond}: {n:?}");
+        // The same condition through expressions no index can use.
+        let seq = cond
+            .replace("a ", "(a + 0) ")
+            .replace("= a", "= (a + 0)")
+            .replace("b ", "(b || '') ")
+            .replace("c ", "(c + 0) ");
+        let seq_sql = format!("SELECT a, b, c FROM t WHERE {seq} ORDER BY a, b, c");
+        assert!(
+            plan_nodes(&mut s, &seq_sql).contains(&"Scan t".to_owned()),
+            "{seq}"
+        );
+        let got = q(&mut s, &sql);
+        assert!(!got.is_empty() || cond.contains("toolong"), "{cond}");
+        assert_eq!(got, q(&mut s, &seq_sql), "{cond}");
+    }
+    for cond in ["a + 1 = 5", "a IS NULL", "a <> 5", "c = a"] {
+        let n = plan_nodes(&mut s, &format!("SELECT * FROM t WHERE {cond}"));
+        assert!(n.contains(&"Scan t".to_owned()), "{cond}: {n:?}");
+    }
+    assert_eq!(
+        q(&mut s, "SELECT count(*) FROM t WHERE a > 90"),
+        q(&mut s, "SELECT count(*) FROM t WHERE a + 0 > 90")
+    );
+
+    // DML through an index.
+    let n = plan_nodes(&mut s, "UPDATE t SET a = a + 1000 WHERE a = 5");
+    assert_eq!(n, ["IndexScan t_a"]);
+    assert_eq!(
+        ok(&mut s, "UPDATE t SET a = a + 1000 WHERE a = 5"),
+        "UPDATE 3"
+    );
+    assert_eq!(
+        q(&mut s, "SELECT count(*) FROM t WHERE a = 5"),
+        rows(&[&["0"]])
+    );
+    assert_eq!(
+        q(&mut s, "SELECT count(*) FROM t WHERE a = 1005"),
+        rows(&[&["3"]])
+    );
+    assert_eq!(ok(&mut s, "DELETE FROM t WHERE a = 1005"), "DELETE 3");
+    assert_eq!(
+        q(&mut s, "SELECT count(*) FROM t WHERE a = 1005"),
+        rows(&[&["0"]])
+    );
+}
+
+#[test]
+fn joins_use_hash_joins_and_pushed_down_filters() {
+    let db = db();
+    let mut s = db.session();
+    ok(&mut s, "CREATE TABLE a (id INT, x TEXT)");
+    ok(&mut s, "CREATE TABLE b (aid INT, y TEXT)");
+    ok(
+        &mut s,
+        "INSERT INTO a VALUES (1, 'one'), (2, 'two'), (3, 'three'), (NULL, 'none')",
+    );
+    ok(
+        &mut s,
+        "INSERT INTO b VALUES (1, 'p'), (1, 'q'), (3, 'r'), (9, 's'), (NULL, 't')",
+    );
+
+    let sql = "SELECT x, y FROM a JOIN b ON a.id = b.aid WHERE a.x <> 'one' AND b.y > 'a'";
+    assert_eq!(
+        plan_nodes(&mut s, sql),
+        ["Project", "HashJoin", "Scan a", "Scan b"],
+        "filters pushed into the scans"
+    );
+    assert_eq!(q(&mut s, sql), rows(&[&["three", "r"]]));
+    let sql = "SELECT x, y FROM a, b WHERE a.id = b.aid ORDER BY 1, 2";
+    assert!(plan_nodes(&mut s, sql).contains(&"HashJoin".to_owned()));
+    assert_eq!(
+        q(&mut s, sql),
+        rows(&[&["one", "p"], &["one", "q"], &["three", "r"]])
+    );
+
+    // Left join: unmatched rows (NULL keys included) are kept; a WHERE on
+    // the nullable side stays above the join.
+    let sql = "SELECT x FROM a LEFT JOIN b ON a.id = b.aid WHERE b.aid IS NULL ORDER BY x";
+    let n = plan_nodes(&mut s, sql);
+    assert_eq!(
+        n[..3],
+        ["Sort".to_owned(), "Project".to_owned(), "Filter".to_owned()],
+        "{n:?}"
+    );
+    assert!(n.contains(&"HashJoin".to_owned()));
+    assert_eq!(q(&mut s, sql), rows(&[&["none"], &["two"]]));
+    let sql = "SELECT x, y FROM a LEFT JOIN b ON a.id = b.aid AND b.y <> 'p' ORDER BY x, y";
+    assert_eq!(
+        q(&mut s, sql),
+        rows(&[
+            &["none", "NULL"],
+            &["one", "q"],
+            &["three", "r"],
+            &["two", "NULL"]
+        ])
+    );
+    // Non-equi joins stay nested loops; residual conditions are kept.
+    let sql = "SELECT count(*) FROM a JOIN b ON a.id < b.aid";
+    assert!(plan_nodes(&mut s, sql).contains(&"NestedLoop".to_owned()));
+    assert_eq!(q(&mut s, sql), rows(&[&["5"]]));
+    let sql = "SELECT count(*) FROM a JOIN b ON a.id = b.aid AND a.x < b.y";
+    assert_eq!(q(&mut s, sql), rows(&[&["2"]]));
+    // Three tables.
+    let sql = "SELECT p.x, q.x FROM a p JOIN b ON p.id = b.aid JOIN a q ON q.id = b.aid + 1 ORDER BY 1, 2";
+    assert_eq!(q(&mut s, sql), rows(&[&["one", "two"], &["one", "two"]]));
 }
