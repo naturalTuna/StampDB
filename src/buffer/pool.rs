@@ -970,6 +970,29 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_dirty_eviction_uses_pool_fence() {
+        let (mem, _disk, pool) = setup_with(4, 16, gate(true, 99));
+        let before = mem.fences().len();
+        std::thread::scope(|s| {
+            for t in 0..4u32 {
+                let pool = &pool;
+                s.spawn(move || {
+                    for i in 0..300u32 {
+                        modify(pool, (i * 7 + t * 3) % 16, (i % 251) as u8);
+                    }
+                });
+            }
+        });
+        pool.flush_all().unwrap();
+        let page_writes = &mem.fences()[before..];
+        assert!(page_writes.len() >= 16);
+        assert!(page_writes.iter().all(|&f| f == FenceToken::new(99)));
+        for b in 0..16 {
+            verify_checksum(&on_disk(&mem, b), BlockNumber(b)).unwrap();
+        }
+    }
+
+    #[test]
     fn concurrent_fetch_with_eviction() {
         let (_mem, pool) = setup(8, 32);
         std::thread::scope(|s| {
