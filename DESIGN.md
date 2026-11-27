@@ -4,6 +4,9 @@
 decisions의 변경은 채팅 리뷰를 거친 뒤에만 반영하고, 반영 시 아래 변경 이력에 남긴다.
 
 ## 변경 이력
+- r12 (2026-11-27)
+  - [추가] 제약 카탈로그 sys_constraint(PG pg_constraint 대응), CHECK 식은 SQL 텍스트로 저장해 사용 시 다시 바인딩, NOT NULL은 attnotnull, PK는 unique 인덱스 + NOT NULL + indisprimary.
+  - [추가] 10단계 범위: CREATE TABLE의 컬럼/테이블 제약과 DEFAULT(SQL 텍스트로 저장). ALTER TABLE ADD/DROP CONSTRAINT는 이후.
 - r11 (2026-11-27)
   - [추가] SQL 실행: 9단계 SQL 범위, 규칙 기반 플래너, 메모리 내 hash join/집계/정렬(spill 없음), PG 텍스트 출력 형식, PG 타입 규칙과 NUMERIC 전까지의 처리.
   - [추가] sqllogictest 기대값은 개발 VM의 사용자 디렉터리에 소스 빌드한 PostgreSQL 18(C locale)로 생성한다.
@@ -268,6 +271,15 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 
 [제약조건]
 - NOT NULL, CHECK, PRIMARY KEY, UNIQUE, FOREIGN KEY.
+- 제약은 시스템 테이블 sys_constraint(PG pg_constraint 대응: 이름, 종류, 테이블, 인덱스, 컬럼 목록, CHECK 식)에 둔다.
+- CHECK 식은 SQL 텍스트로 저장하고 사용할 때마다 다시 바인딩한다 (PG는 식 트리를 직렬화한 conbin). 결과가 false인 행만 거부한다 (NULL은 통과).
+  근거: 식 직렬화 형식을 따로 설계·유지하지 않는다. 카탈로그 캐시가 없어 문장마다 다시 바인딩하는 비용을 감수한다.
+- NOT NULL은 sys_attribute.attnotnull로만 표현한다 (PG 18의 NOT NULL용 pg_constraint 행은 두지 않는다).
+- PRIMARY KEY는 unique 인덱스 + 컬럼 NOT NULL + indisprimary, 테이블당 하나. UNIQUE는 unique 인덱스. 인덱스 이름이 곧 제약 이름이다.
+- 제약 이름은 PG 규칙을 따른다 (t_pkey, t_a_key, t_a_check / 여러 컬럼을 참조하는 CHECK는 t_check, 충돌 시 숫자 접미사). 오류는 23502, 23505, 23514.
+- 검사 순서는 PG와 같다: NOT NULL(컬럼 순서) → CHECK(이름 순서) → 인덱스 삽입 시 UNIQUE/PK.
+- 10단계 범위는 CREATE TABLE의 컬럼/테이블 제약이다. ALTER TABLE ADD/DROP CONSTRAINT는 이후로 미룬다.
+- DEFAULT는 sys_attribute에 SQL 텍스트로 저장하고 INSERT/UPDATE의 DEFAULT 위치에서 다시 바인딩한다. 컬럼을 참조할 수 없다.
 - PK와 UNIQUE는 B+Tree 인덱스로 강제한다.
 - FOREIGN KEY는 다음 범위로 제한한다:
   - 동작은 NO ACTION / RESTRICT만 지원. CASCADE, SET NULL은 open_questions 참조.
