@@ -3,11 +3,13 @@
 pub mod control;
 pub mod log;
 pub mod record;
+pub mod recovery;
 
 use crate::storage::StorageError;
 
 pub use control::{ControlData, ControlFile, DbState};
 pub use log::{Wal, WalConfig, WalReader};
+pub use recovery::{Engine, RecoveryError, initdb};
 
 /// Errors from WAL operations that are not fatal.
 #[derive(Debug, thiserror::Error)]

@@ -44,6 +44,13 @@ impl MemBackend {
             .unwrap_or_default()
     }
 
+    /// Overwrites stored bytes in place (simulating a torn write).
+    pub(crate) fn overwrite(&self, file: FileKey, offset: usize, bytes: &[u8]) {
+        if let Some(data) = self.files.lock().get_mut(&file) {
+            data[offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
+    }
+
     /// Flips one byte of a stored file.
     pub(crate) fn corrupt(&self, file: FileKey, offset: usize) {
         if let Some(data) = self.files.lock().get_mut(&file) {

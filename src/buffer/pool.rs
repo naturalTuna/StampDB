@@ -154,6 +154,11 @@ impl BufferPool {
         self
     }
 
+    /// Current fencing token (from the flush control).
+    pub fn fence_token(&self) -> crate::storage::backend::FenceToken {
+        self.control.fence_token()
+    }
+
     /// The attached WAL, if any.
     pub fn wal(&self) -> Option<&Arc<Wal>> {
         self.wal.as_ref()
@@ -167,6 +172,14 @@ impl BufferPool {
     /// Pins the page `tag`, reading it from disk if it is not resident.
     pub fn fetch(&self, tag: BufferTag) -> Result<PinGuard<'_>> {
         self.pin_or_load(tag, Fill::Read)
+    }
+
+    /// Pins `tag` without reading it from disk if it is not resident (the
+    /// frame is zero-filled). For recovery of blocks whose WAL record
+    /// rebuilds the whole page (full image or will-init), so a torn page on
+    /// disk is never read (PostgreSQL's `RBM_ZERO_AND_LOCK`).
+    pub fn fetch_for_overwrite(&self, tag: BufferTag) -> Result<PinGuard<'_>> {
+        self.pin_or_load(tag, Fill::Zero)
     }
 
     /// Appends a new block to `rel` and returns it pinned.
@@ -193,11 +206,20 @@ impl BufferPool {
 
     /// Writes every dirty page in the pool and syncs the files written to.
     pub fn flush_all(&self) -> Result<FlushStats> {
-        let (stats, written_rels) = self.flush_matching(|_| true)?;
-        for rel in written_rels {
-            self.disk.sync_relation(rel)?;
-        }
+        let stats = self.write_all()?;
+        self.disk.sync_pending()?;
         Ok(stats)
+    }
+
+    /// Writes every dirty page without syncing (a checkpoint syncs
+    /// separately, so it can treat a sync failure as fatal).
+    pub fn write_all(&self) -> Result<FlushStats> {
+        Ok(self.flush_matching(|_| true)?.0)
+    }
+
+    /// Syncs every relation written since its last sync.
+    pub fn sync_pending(&self) -> Result<()> {
+        Ok(self.disk.sync_pending()?)
     }
 
     /// Discards all buffers of `rel` without writing them (for DROP TABLE;

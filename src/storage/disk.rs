@@ -7,7 +7,13 @@
 //!
 //! Only `extend` may write past the end of a file; it is serialized by an
 //! internal lock (the role of PostgreSQL's relation extension lock).
+//!
+//! Every relation written since its last sync is remembered, so a
+//! checkpoint can make all of them durable with [`DiskManager::sync_pending`]
+//! (PostgreSQL's pending fsync requests), including pages written by
+//! eviction between checkpoints.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -23,6 +29,8 @@ use super::{Result, StorageError};
 pub struct DiskManager {
     backend: Arc<dyn StorageBackend>,
     extend_lock: Mutex<()>,
+    /// Relations written since they were last synced.
+    pending_sync: Mutex<HashSet<RelFileId>>,
 }
 
 impl DiskManager {
@@ -30,6 +38,7 @@ impl DiskManager {
         Self {
             backend,
             extend_lock: Mutex::new(()),
+            pending_sync: Mutex::new(HashSet::new()),
         }
     }
 
@@ -40,6 +49,7 @@ impl DiskManager {
 
     /// Removes a relation file.
     pub fn remove_relation(&self, rel: RelFileId, fence: FenceToken) -> Result<()> {
+        self.forget(rel);
         self.backend.remove(FileKey::Relation(rel), fence)
     }
 
@@ -83,7 +93,9 @@ impl DiskManager {
             set_checksum(buf, blk)?;
         }
         self.backend
-            .write_at(FileKey::Relation(rel), blk.byte_offset(), buf, fence)
+            .write_at(FileKey::Relation(rel), blk.byte_offset(), buf, fence)?;
+        self.pending_sync.lock().insert(rel);
+        Ok(())
     }
 
     /// Appends an all-zero page and returns its block number.
@@ -99,7 +111,26 @@ impl DiskManager {
         let zero = AlignedBuf::new(PAGE_SIZE)?;
         self.backend
             .write_at(FileKey::Relation(rel), blk.byte_offset(), &zero, fence)?;
+        self.pending_sync.lock().insert(rel);
         Ok(blk)
+    }
+
+    /// Syncs every relation written since its last sync. On error, the
+    /// relations not yet synced stay pending.
+    pub fn sync_pending(&self) -> Result<()> {
+        let rels: Vec<RelFileId> = self.pending_sync.lock().drain().collect();
+        for (i, rel) in rels.iter().enumerate() {
+            if let Err(e) = self.backend.sync(FileKey::Relation(*rel)) {
+                self.pending_sync.lock().extend(rels[i..].iter().copied());
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Forgets pending syncs of a removed relation.
+    fn forget(&self, rel: RelFileId) {
+        self.pending_sync.lock().remove(&rel);
     }
 
     /// Makes written pages and extensions durable (fdatasync).
