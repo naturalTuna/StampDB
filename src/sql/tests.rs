@@ -1214,3 +1214,37 @@ fn autovacuum_thread_cleans_up_in_the_background() {
     assert!(weak.upgrade().is_none());
     drop(av);
 }
+
+#[test]
+fn pg_stat_user_tables_view() {
+    let db = db();
+    let mut s = db.session();
+    ok(&mut s, "CREATE TABLE a (x int)");
+    ok(&mut s, "CREATE TABLE b (x int)");
+    ok(&mut s, "INSERT INTO a VALUES (1), (2), (3)");
+    ok(&mut s, "UPDATE a SET x = 0 WHERE x = 1");
+    ok(&mut s, "DELETE FROM a WHERE x = 2");
+    let sql = "SELECT relname, n_tup_ins, n_tup_upd, n_tup_del, n_live_tup, n_dead_tup, \
+               vacuum_count, last_vacuum IS NULL FROM pg_stat_user_tables ORDER BY relname";
+    assert_eq!(
+        q(&mut s, sql),
+        rows(&[
+            &["a", "3", "1", "1", "2", "2", "0", "t"],
+            &["b", "0", "0", "0", "0", "0", "0", "t"],
+        ])
+    );
+    ok(&mut s, "VACUUM a");
+    assert_eq!(
+        q(
+            &mut s,
+            "SELECT s.relname, s.n_dead_tup, s.vacuum_count, s.last_vacuum IS NOT NULL \
+             FROM pg_stat_user_tables s JOIN a ON s.n_live_tup = a.x + 2 WHERE a.x = 0"
+        ),
+        rows(&[&["a", "0", "1", "t"]])
+    );
+    // Not a table: cannot be written.
+    assert_eq!(
+        fails(&mut s, "DELETE FROM pg_stat_user_tables").code,
+        code::UNDEFINED_TABLE
+    );
+}

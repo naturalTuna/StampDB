@@ -206,7 +206,10 @@ impl Session {
         };
         let mut t = self.db.begin(self.default_isolation);
         t.statement_snapshot();
-        let plan = match Binder::new(&self.db.catalog, &mut t).bind(stmt) {
+        let plan = match Binder::new(&self.db.catalog, &mut t)
+            .with_stats(&self.db.stats)
+            .bind(stmt)
+        {
             Ok(Bound::Query { plan, .. }) => self.optimize(&mut t, plan),
             Ok(Bound::Insert { source, .. }) => self.optimize(&mut t, source),
             Ok(Bound::Update { scan, .. } | Bound::Delete { scan, .. }) => {
@@ -363,7 +366,9 @@ impl Session {
         match kind {
             Kind::Utility(u) => self.utility(txn, u),
             Kind::Plannable(stmt) => {
-                let bound = Binder::new(&self.db.catalog, txn).bind(stmt)?;
+                let bound = Binder::new(&self.db.catalog, txn)
+                    .with_stats(&self.db.stats)
+                    .bind(stmt)?;
                 self.execute_bound(txn, bound)
             }
         }

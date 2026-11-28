@@ -11,8 +11,10 @@ use super::datum::parse_value;
 use super::error::{Result, SqlError, code};
 use super::expr::{BinOp, CastMode, Expr, Func, cast};
 use super::plan::{AggCall, AggFunc, JoinKind, OutCol, Plan, SortKey};
+use super::sysviews;
 use crate::catalog::{Catalog, Column, FkAction, RelKind, RelationInfo};
 use crate::lock::LockMode;
+use crate::stats::StatsCollector;
 use crate::storage::backend::RelFileId;
 use crate::txn::{Isolation, Transaction};
 use crate::types::{DataType, Value};
@@ -572,6 +574,49 @@ pub fn classify(stmt: &ast::Statement) -> Result<Kind<'_>> {
     }))
 }
 
+/// A system view in FROM: its rows as constants.
+fn view_factor(
+    name: &str,
+    alias: Option<&ast::TableAlias>,
+    v: sysviews::ViewRows,
+) -> Result<(Plan, Scope)> {
+    let mut label = name.to_owned();
+    let mut names: Vec<String> = v.columns.iter().map(|(n, _)| (*n).to_owned()).collect();
+    if let Some(a) = alias {
+        label = ident(&a.name);
+        if a.columns.len() > names.len() {
+            return Err(err(
+                code::INVALID_COLUMN_REFERENCE,
+                format!(
+                    "table \"{label}\" has {} columns available but {} columns specified",
+                    names.len(),
+                    a.columns.len()
+                ),
+            ));
+        }
+        for (n, c) in names.iter_mut().zip(&a.columns) {
+            *n = ident(&c.name);
+        }
+    }
+    let cols = v
+        .columns
+        .iter()
+        .zip(names)
+        .map(|(&(_, ty), name)| ScopeCol {
+            table: label.clone(),
+            name,
+            ty,
+        })
+        .collect();
+    let width = v.columns.len();
+    let rows = v
+        .rows
+        .into_iter()
+        .map(|r| r.into_iter().map(Expr::Const).collect())
+        .collect();
+    Ok((Plan::Values { rows, width }, Scope { cols }))
+}
+
 /// Numeric ordering of the number types for implicit promotion.
 fn numeric_rank(t: DataType) -> Option<u8> {
     match t {
@@ -792,6 +837,8 @@ pub struct Binder<'a> {
     txn: &'a mut Transaction,
     aggs: Vec<AggCall>,
     in_agg: bool,
+    /// Statistics for the statistics views (none: the views are empty).
+    stats: Option<&'a StatsCollector>,
 }
 
 impl<'a> Binder<'a> {
@@ -801,7 +848,14 @@ impl<'a> Binder<'a> {
             txn,
             aggs: Vec::new(),
             in_agg: false,
+            stats: None,
         }
+    }
+
+    /// Lets queries read the statistics views from `stats`.
+    pub fn with_stats(mut self, stats: &'a StatsCollector) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     pub fn bind(&mut self, stmt: &ast::Statement) -> Result<Bound> {
@@ -932,6 +986,11 @@ impl<'a> Binder<'a> {
                 ..
             } if with_hints.is_empty() => {
                 let tname = object_name(name)?;
+                let empty = StatsCollector::new();
+                let stats = self.stats.unwrap_or(&empty);
+                if let Some(v) = sysviews::view(&tname, self.cat, self.txn, stats)? {
+                    return view_factor(&tname, alias.as_ref(), v);
+                }
                 let table = self.open_table(&tname, LockMode::AccessShare)?;
                 let mut label = tname;
                 let mut names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();

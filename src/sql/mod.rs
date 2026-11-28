@@ -13,6 +13,7 @@ pub mod plan;
 pub mod planner;
 pub mod ri;
 pub mod session;
+pub mod sysviews;
 pub mod writer;
 
 #[cfg(test)]
