@@ -100,6 +100,10 @@ impl Database {
         Ok(Some(stats))
     }
 
+    pub fn lock_manager(&self) -> &Arc<LockManager> {
+        &self.locks
+    }
+
     /// Table statistics (DESIGN r14).
     pub fn stats(&self) -> &Arc<StatsCollector> {
         &self.stats

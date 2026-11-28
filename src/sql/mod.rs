@@ -6,6 +6,7 @@ pub mod error;
 pub mod expr;
 
 pub use error::{Result, SqlError};
+pub mod autovacuum;
 pub mod binder;
 pub mod exec;
 pub mod plan;
@@ -17,4 +18,5 @@ pub mod writer;
 #[cfg(test)]
 mod tests;
 
+pub use autovacuum::{Autovacuum, AutovacuumConfig};
 pub use session::{Database, QueryResult, Session};

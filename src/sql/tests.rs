@@ -1105,3 +1105,112 @@ fn vacuum_errors() {
     assert_eq!(s.status(), 'E');
     ok(&mut s, "ROLLBACK");
 }
+
+fn fast_autovacuum() -> AutovacuumConfig {
+    AutovacuumConfig {
+        naptime: Duration::from_millis(20),
+        ..AutovacuumConfig::default()
+    }
+}
+
+#[test]
+fn autovacuum_threshold() {
+    let cfg = AutovacuumConfig::default();
+    let st = |live, dead| crate::stats::TableStats {
+        n_live_tup: live,
+        n_dead_tup: dead,
+        ..Default::default()
+    };
+    assert!(!cfg.needs_vacuum(&st(0, 50)));
+    assert!(cfg.needs_vacuum(&st(0, 51)));
+    assert!(!cfg.needs_vacuum(&st(1000, 250)));
+    assert!(cfg.needs_vacuum(&st(1000, 251)));
+}
+
+#[test]
+fn autovacuum_round_vacuums_due_tables_and_skips_locked_ones() {
+    let db = db();
+    let mut s = db.session();
+    let cfg = AutovacuumConfig::default();
+    ok(&mut s, "CREATE TABLE t (a int PRIMARY KEY, b int)");
+    ok(&mut s, "CREATE TABLE small (a int)");
+    let vals: Vec<String> = (0..100).map(|i| format!("({i}, 0)")).collect();
+    ok(&mut s, &format!("INSERT INTO t VALUES {}", vals.join(", ")));
+    ok(&mut s, "INSERT INTO small VALUES (1), (2)");
+    ok(&mut s, "DELETE FROM small");
+    // 60 dead of 100 live: 60 > 50 + 20 is false.
+    ok(&mut s, "UPDATE t SET b = 1 WHERE a < 60");
+    let (t, small) = (table_oid(&db, "t"), table_oid(&db, "small"));
+    assert!(!db.autovacuum_round(&cfg).vacuumed.contains(&t));
+    ok(&mut s, "UPDATE t SET b = 2 WHERE a < 20");
+    // 80 > 70; a concurrent CREATE INDEX holds a conflicting lock.
+    let mut ddl = db.session();
+    ok(&mut ddl, "BEGIN");
+    ok(&mut ddl, "CREATE INDEX t_b ON t (b)");
+    let r = db.autovacuum_round(&cfg);
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!((r.vacuumed.contains(&t), r.skipped), (false, vec![t]));
+    ok(&mut ddl, "COMMIT");
+    let r = db.autovacuum_round(&cfg);
+    assert!(r.vacuumed.contains(&t) && !r.vacuumed.contains(&small));
+    let st = db.stats().get(t);
+    assert_eq!(
+        (st.n_live_tup, st.n_dead_tup, st.autovacuum_count),
+        (100, 0, 1)
+    );
+    assert!(st.last_autovacuum.is_some() && st.last_vacuum.is_none());
+    // Dropped tables lose their statistics.
+    ok(&mut s, "DROP TABLE t");
+    let vals: Vec<String> = (0..60).map(|i| format!("({i})")).collect();
+    ok(
+        &mut s,
+        &format!("INSERT INTO small VALUES {}", vals.join(", ")),
+    );
+    ok(&mut s, "DELETE FROM small");
+    db.stats().apply(
+        &crate::stats::XactCounts::from([(
+            t,
+            crate::stats::RelCounts {
+                inserted: 0,
+                updated: 0,
+                deleted: 99,
+            },
+        )]),
+        true,
+    );
+    let r = db.autovacuum_round(&cfg);
+    assert_eq!(r.vacuumed, vec![small]);
+    assert_eq!(db.stats().get(t), crate::stats::TableStats::default());
+}
+
+#[test]
+fn autovacuum_thread_cleans_up_in_the_background() {
+    let db = db();
+    let av = Autovacuum::start(&db, fast_autovacuum()).unwrap();
+    let mut s = db.session();
+    ok(&mut s, "CREATE TABLE t (a int PRIMARY KEY)");
+    let vals: Vec<String> = (0..100).map(|i| format!("({i})")).collect();
+    ok(&mut s, &format!("INSERT INTO t VALUES {}", vals.join(", ")));
+    ok(&mut s, "DELETE FROM t WHERE a >= 10");
+    let oid = table_oid(&db, "t");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while db.stats().get(oid).autovacuum_count == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "autovacuum did not run"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(av);
+    let st = db.stats().get(oid);
+    assert_eq!((st.n_live_tup, st.n_dead_tup), (10, 0));
+    assert_eq!(q(&mut s, "SELECT count(*) FROM t"), rows(&[&["10"]]));
+    // The thread does not keep the database alive.
+    let weak = Arc::downgrade(&db);
+    let av = Autovacuum::start(&db, fast_autovacuum()).unwrap();
+    drop(s);
+    drop(db);
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(weak.upgrade().is_none());
+    drop(av);
+}
