@@ -22,6 +22,7 @@ use crate::access::tuple::deform_tuple;
 use crate::access::visibility::Me;
 use crate::catalog::{Catalog, Column, ConstraintKind, NewConstraint, RelKind, RelationInfo};
 use crate::lock::{LockManager, WaitPolicy};
+use crate::stats::StatsCollector;
 use crate::txn::{Isolation, Transaction, TransactionManager};
 use crate::types::Value;
 use crate::wal::Engine;
@@ -33,6 +34,7 @@ pub struct Database {
     catalog: Catalog,
     locks: Arc<LockManager>,
     policy: WaitPolicy,
+    stats: Arc<StatsCollector>,
 }
 
 impl Database {
@@ -41,6 +43,7 @@ impl Database {
             catalog: Catalog::open(engine)?,
             locks: Arc::new(LockManager::new()),
             policy,
+            stats: Arc::new(StatsCollector::new()),
         }))
     }
 
@@ -50,6 +53,11 @@ impl Database {
 
     pub fn engine(&self) -> &Arc<Engine> {
         self.catalog.engine()
+    }
+
+    /// Table statistics (DESIGN r14).
+    pub fn stats(&self) -> &Arc<StatsCollector> {
+        &self.stats
     }
 
     pub fn session(self: &Arc<Self>) -> Session {
@@ -63,6 +71,7 @@ impl Database {
     fn begin(&self, isolation: Isolation) -> Transaction {
         let tm: Arc<dyn TransactionManager> = self.engine().txn().clone();
         Transaction::begin(tm, self.locks.clone(), isolation, self.policy)
+            .with_stats(self.stats.clone())
     }
 }
 
@@ -97,7 +106,7 @@ impl QueryResult {
 #[derive(Debug)]
 enum State {
     Idle,
-    Block(Transaction),
+    Block(Box<Transaction>),
     /// A block whose transaction failed (and was already aborted, which
     /// released its locks); waits for COMMIT or ROLLBACK.
     Failed,
@@ -183,7 +192,7 @@ impl Session {
             }
             (State::Idle, Kind::Utility(Utility::Begin(iso))) => {
                 let t = self.db.begin(iso.unwrap_or(self.default_isolation));
-                self.state = State::Block(t);
+                self.state = State::Block(Box::new(t));
                 Ok(QueryResult::tag("BEGIN"))
             }
             (State::Block(t), Kind::Utility(Utility::Begin(_))) => {

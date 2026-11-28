@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use super::{CommandId, Snapshot, TransactionManager, TxnError, TxnId, Xid};
 use crate::lock::{LockError, LockManager, LockMode, LockTag, WaitPolicy};
+use crate::stats::{StatsCollector, XactCounts};
 use crate::storage::backend::RelFileId;
 
 /// Supported isolation levels (DESIGN: no SSI).
@@ -54,6 +55,9 @@ pub struct Transaction {
     drop_on_commit: Vec<RelFileId>,
     /// Relation files to delete if it aborts (CREATE).
     drop_on_abort: Vec<RelFileId>,
+    /// Where this transaction's table counts go when it ends.
+    stats: Option<Arc<StatsCollector>>,
+    counts: XactCounts,
 }
 
 impl Transaction {
@@ -76,7 +80,30 @@ impl Transaction {
             finished: false,
             drop_on_commit: Vec::new(),
             drop_on_abort: Vec::new(),
+            stats: None,
+            counts: XactCounts::new(),
         }
+    }
+
+    /// Reports this transaction's table counts to `stats` when it ends.
+    pub fn with_stats(mut self, stats: Arc<StatsCollector>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    /// Counts a row inserted into table `oid` (for statistics).
+    pub fn count_insert(&mut self, oid: u32) {
+        self.counts.entry(oid).or_default().inserted += 1;
+    }
+
+    /// Counts a row of table `oid` updated (a new version written).
+    pub fn count_update(&mut self, oid: u32) {
+        self.counts.entry(oid).or_default().updated += 1;
+    }
+
+    /// Counts a row of table `oid` deleted.
+    pub fn count_delete(&mut self, oid: u32) {
+        self.counts.entry(oid).or_default().deleted += 1;
     }
 
     pub fn id(&self) -> TxnId {
@@ -206,6 +233,9 @@ impl Transaction {
             Some(x) => self.tm.abort_dropping(x, &self.drop_on_abort),
             None => Ok(()),
         };
+        if let Some(stats) = &self.stats {
+            stats.apply(&self.counts, commit && res.is_ok());
+        }
         // Locks go after the outcome is recorded, so waiters see it.
         self.locks.release_all(self.id);
         self.tm.release_snapshot(self.id);

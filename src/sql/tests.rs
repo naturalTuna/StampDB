@@ -1009,3 +1009,44 @@ fn cascades_wait_for_and_follow_concurrent_child_updates() {
     assert_eq!(r.unwrap()[0].tag, "DELETE 1");
     assert_eq!(q(&mut a, "SELECT id, pid FROM c"), rows(&[&["20", "3"]]));
 }
+
+/// The oid of table `name`.
+pub(super) fn table_oid(db: &Database, name: &str) -> u32 {
+    let tm: Arc<dyn crate::txn::TransactionManager> = db.engine().txn().clone();
+    let mut t = crate::txn::Transaction::begin(
+        tm,
+        Arc::new(crate::lock::LockManager::new()),
+        crate::txn::Isolation::ReadCommitted,
+        WaitPolicy::default(),
+    );
+    let oid = db
+        .catalog()
+        .lookup_relation(&mut t, name)
+        .unwrap()
+        .unwrap()
+        .oid;
+    t.abort().unwrap();
+    oid
+}
+
+#[test]
+fn transactions_report_table_counts() {
+    let db = db();
+    let mut s = db.session();
+    ok(&mut s, "CREATE TABLE t (a int PRIMARY KEY, b int)");
+    ok(&mut s, "INSERT INTO t VALUES (1, 0), (2, 0)");
+    ok(&mut s, "INSERT INTO t VALUES (3, 0), (4, 0), (5, 0)");
+    ok(&mut s, "UPDATE t SET b = 1 WHERE a <= 2");
+    ok(&mut s, "DELETE FROM t WHERE a = 5");
+    ok(&mut s, "BEGIN");
+    ok(&mut s, "INSERT INTO t VALUES (6, 0), (7, 0)");
+    ok(&mut s, "UPDATE t SET b = 2 WHERE a = 1");
+    ok(&mut s, "ROLLBACK");
+    // A failed statement's insert is counted as dead too.
+    fails(&mut s, "INSERT INTO t VALUES (8, 0), (1, 0)");
+    let st = db.stats().get(table_oid(&db, "t"));
+    assert_eq!((st.n_tup_ins, st.n_tup_upd, st.n_tup_del), (9, 3, 1));
+    assert_eq!(st.n_live_tup, 4);
+    // 2 old versions + 1 deleted; 2 + 1 rolled back; 2 from the failure.
+    assert_eq!(st.n_dead_tup, 8);
+}

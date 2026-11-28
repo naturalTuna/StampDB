@@ -526,6 +526,7 @@ impl Catalog {
         let t = form_tuple(&desc_of(table)?, row, xid, txn.command_id())?;
         let heap = self.heap(table)?;
         let tid = heap.insert(&t)?;
+        txn.count_insert(table.0);
         for (idx, tree) in &self.indexes {
             if idx.table != table {
                 continue;
@@ -1197,7 +1198,10 @@ impl Catalog {
 
     fn delete_row(&self, txn: &mut Transaction, table: RelFileId, tid: Tid) -> Result<()> {
         match self.heap(table)?.delete_waiting(tid, txn)? {
-            TmResult::Ok(_) => Ok(()),
+            TmResult::Ok(_) => {
+                txn.count_delete(table.0);
+                Ok(())
+            }
             _ => Err(CatalogError::Corrupt("catalog row changed concurrently")),
         }
     }

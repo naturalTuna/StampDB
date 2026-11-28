@@ -90,6 +90,7 @@ impl<'a> Writer<'a> {
         let xid = txn.write_xid()?;
         let t = form_tuple(&tw.table.desc(), row, xid, txn.command_id())?;
         let tid = tw.heap.insert(&t)?;
+        txn.count_insert(tw.table.oid);
         self.add_index_entries(txn, tw, row, tid)?;
         for fk in &tw.rules.fk_out {
             ri::check_reference(&self.pool, txn, &tw.table, fk, row)?;
@@ -114,6 +115,7 @@ impl<'a> Writer<'a> {
         let TmResult::Ok(new_tid) = r else {
             return Ok(r);
         };
+        txn.count_update(tw.table.oid);
         self.add_index_entries(txn, tw, new, new_tid)?;
         for fk in &tw.rules.fk_in {
             if ri::key_changed(&fk.cols, old, new) {
@@ -138,6 +140,7 @@ impl<'a> Writer<'a> {
     ) -> Result<TmResult> {
         let r = tw.heap.delete_waiting(tid, txn)?;
         if let TmResult::Ok(_) = r {
+            txn.count_delete(tw.table.oid);
             for fk in &tw.rules.fk_in {
                 self.parent_changed(txn, tw, fk, old, None)?;
             }
