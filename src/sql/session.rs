@@ -5,6 +5,7 @@
 //! failed state where everything but COMMIT/ROLLBACK is refused (25P02).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use sqlparser::ast;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -17,14 +18,17 @@ use super::expr::{Expr, is_true};
 use super::plan::{OutCol, Plan};
 use super::planner;
 use super::writer::Writer;
+use crate::access::btree::BTree;
 use crate::access::heap::{HeapFile, TmResult};
 use crate::access::tuple::deform_tuple;
 use crate::access::visibility::Me;
 use crate::catalog::{Catalog, Column, ConstraintKind, NewConstraint, RelKind, RelationInfo};
+use crate::lock::LockMode;
 use crate::lock::{LockManager, WaitPolicy};
-use crate::stats::StatsCollector;
+use crate::stats::{StatsCollector, VacuumReport};
 use crate::txn::{Isolation, Transaction, TransactionManager};
 use crate::types::Value;
+use crate::vacuum::{self, VacuumStats};
 use crate::wal::Engine;
 use crate::wal::recovery::FIRST_OID;
 
@@ -53,6 +57,47 @@ impl Database {
 
     pub fn engine(&self) -> &Arc<Engine> {
         self.catalog.engine()
+    }
+
+    /// Vacuums one table in its own transaction and records the result in
+    /// the statistics. Autovacuum (`auto`) does not wait for the table
+    /// lock: it fails with 55P03 instead. A table dropped meanwhile is
+    /// skipped (`None`).
+    pub fn vacuum_table(&self, table: &RelationInfo, auto: bool) -> Result<Option<VacuumStats>> {
+        let policy = if auto {
+            WaitPolicy {
+                lock_timeout: Some(Duration::ZERO),
+                ..self.policy
+            }
+        } else {
+            self.policy
+        };
+        let tm: Arc<dyn TransactionManager> = self.engine().txn().clone();
+        let mut t = Transaction::begin(tm, self.locks.clone(), Isolation::ReadCommitted, policy)
+            .with_stats(self.stats.clone());
+        t.lock_relation(table.rel, LockMode::ShareUpdateExclusive)?;
+        t.statement_snapshot();
+        if self.catalog.lookup_oid(&mut t, table.oid)?.is_none() {
+            return Ok(None);
+        }
+        let stats = if table.oid < FIRST_OID {
+            self.catalog.vacuum_system_table(&mut t, table.rel)?
+        } else {
+            let heap = HeapFile::open(table.rel, self.engine().pool().clone())?;
+            let indexes = self.catalog.table_indexes(&mut t, table)?;
+            let trees: Vec<&BTree> = indexes.iter().map(|(_, b)| b).collect();
+            vacuum::vacuum(&heap, &trees, &mut t)?
+        };
+        t.commit()?;
+        self.stats.report_vacuum(
+            table.oid,
+            VacuumReport {
+                live: stats.live_tuples as u64,
+                dead: stats.recently_dead_tuples as u64,
+                auto,
+            },
+        );
+        Ok(Some(stats))
     }
 
     /// Table statistics (DESIGN r14).
@@ -227,6 +272,17 @@ impl Session {
             }
             (State::Idle, Kind::Utility(Utility::SetTransaction(_))) => Ok(QueryResult::tag("SET")
                 .with_notice("WARNING: SET TRANSACTION can only be used in transaction blocks")),
+            (State::Block(t), Kind::Utility(Utility::Vacuum { .. })) => {
+                self.state = State::Block(t);
+                self.fail()?;
+                Err(SqlError::new(
+                    code::ACTIVE_SQL_TRANSACTION,
+                    "VACUUM cannot run inside a transaction block",
+                ))
+            }
+            (State::Idle, Kind::Utility(Utility::Vacuum { table })) => {
+                self.vacuum(table.as_deref())
+            }
             (State::Block(mut t), kind) => {
                 let r = self.run_in(&mut t, &kind);
                 t.next_command();
@@ -253,6 +309,37 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// VACUUM of table `name`, or of every table; each table is vacuumed
+    /// in its own transaction.
+    fn vacuum(&self, name: Option<&str>) -> Result<QueryResult> {
+        let cat = &self.db.catalog;
+        let mut t = self.db.begin(self.default_isolation);
+        t.statement_snapshot();
+        let mut r = QueryResult::tag("VACUUM");
+        let targets = match name {
+            None => cat.tables(&mut t),
+            Some(n) => match cat.lookup_relation(&mut t, n) {
+                Ok(None) => Err(SqlError::new(
+                    code::UNDEFINED_TABLE,
+                    format!("relation \"{n}\" does not exist"),
+                ))?,
+                Ok(Some(info)) if info.kind != RelKind::Table => {
+                    r = r.with_notice(format!(
+                        "WARNING: skipping \"{n}\" --- cannot vacuum non-tables or special system tables"
+                    ));
+                    Ok(Vec::new())
+                }
+                Ok(Some(info)) => Ok(vec![info]),
+                Err(e) => Err(e),
+            },
+        };
+        t.abort()?;
+        for info in targets? {
+            self.db.vacuum_table(&info, false)?;
+        }
+        Ok(r)
     }
 
     /// Aborts an open block's transaction, leaving the block failed.
@@ -392,9 +479,10 @@ impl Session {
             Utility::Begin(_)
             | Utility::Commit
             | Utility::Rollback
-            | Utility::SetTransaction(_) => {
-                Err(SqlError::internal("transaction control inside a statement"))
-            }
+            | Utility::SetTransaction(_)
+            | Utility::Vacuum { .. } => Err(SqlError::internal(
+                "transaction control or VACUUM inside a statement",
+            )),
         }
     }
 

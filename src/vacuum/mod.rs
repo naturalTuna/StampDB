@@ -47,6 +47,22 @@ pub struct VacuumStats {
     pub tuples_removed: usize,
     pub index_entries_removed: usize,
     pub index_pages_deleted: usize,
+    /// Tuples left visible to someone (including ones being deleted).
+    pub live_tuples: usize,
+    /// Dead tuples some snapshot may still see (not removable yet).
+    pub recently_dead_tuples: usize,
+}
+
+impl VacuumStats {
+    /// Adds the figures of another run.
+    pub fn add(&mut self, o: &VacuumStats) {
+        self.heap_pages += o.heap_pages;
+        self.tuples_removed += o.tuples_removed;
+        self.index_entries_removed += o.index_entries_removed;
+        self.index_pages_deleted += o.index_pages_deleted;
+        self.live_tuples += o.live_tuples;
+        self.recently_dead_tuples += o.recently_dead_tuples;
+    }
 }
 
 /// Vacuums `heap` and its `indexes` within `txn` (which gets the table
@@ -62,7 +78,10 @@ pub fn vacuum(heap: &HeapFile, indexes: &[&BTree], txn: &mut Transaction) -> Res
 
     let mut dead: BTreeMap<BlockNumber, Vec<SlotId>> = BTreeMap::new();
     for blk in 0..stats.heap_pages {
-        for t in heap.prune_page(BlockNumber(blk), horizon, tm)? {
+        let p = heap.prune_page(BlockNumber(blk), horizon, tm)?;
+        stats.live_tuples += p.live;
+        stats.recently_dead_tuples += p.recently_dead;
+        for t in p.dead {
             dead.entry(t.blk).or_default().push(t.slot);
         }
     }

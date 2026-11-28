@@ -1050,3 +1050,58 @@ fn transactions_report_table_counts() {
     // 2 old versions + 1 deleted; 2 + 1 rolled back; 2 from the failure.
     assert_eq!(st.n_dead_tup, 8);
 }
+
+#[test]
+fn vacuum_command_resets_dead_tuple_counts() {
+    let db = db();
+    let mut s = db.session();
+    ok(&mut s, "CREATE TABLE t (a int PRIMARY KEY, b int)");
+    ok(&mut s, "CREATE INDEX t_b ON t (b)");
+    ok(
+        &mut s,
+        "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (4, 0)",
+    );
+    ok(&mut s, "UPDATE t SET b = 1 WHERE a <= 2");
+    ok(&mut s, "DELETE FROM t WHERE a = 4");
+    let oid = table_oid(&db, "t");
+    assert_eq!(db.stats().get(oid).n_dead_tup, 3);
+    assert_eq!(ok(&mut s, "VACUUM t"), "VACUUM");
+    let st = db.stats().get(oid);
+    assert_eq!((st.n_live_tup, st.n_dead_tup, st.vacuum_count), (3, 0, 1));
+    assert!(st.last_vacuum.is_some());
+    assert_eq!(
+        q(&mut s, "SELECT a, b FROM t WHERE b = 1 ORDER BY a"),
+        rows(&[&["1", "1"], &["2", "1"]])
+    );
+
+    // A snapshot that can still see deleted rows keeps them (recently dead).
+    let mut old = db.session();
+    ok(&mut old, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    q(&mut old, "SELECT * FROM t");
+    ok(&mut s, "DELETE FROM t WHERE a = 3");
+    ok(&mut s, "VACUUM");
+    let st = db.stats().get(oid);
+    assert_eq!((st.n_live_tup, st.n_dead_tup, st.vacuum_count), (2, 1, 2));
+    assert_eq!(q(&mut old, "SELECT count(*) FROM t"), rows(&[&["3"]]));
+    ok(&mut old, "COMMIT");
+    // VACUUM without a table name covers the system tables as well.
+    assert_eq!(db.stats().get(1259).vacuum_count, 1);
+}
+
+#[test]
+fn vacuum_errors() {
+    let db = db();
+    let mut s = db.session();
+    ok(&mut s, "CREATE TABLE t (a int PRIMARY KEY)");
+    assert_eq!(fails(&mut s, "VACUUM nope").code, code::UNDEFINED_TABLE);
+    assert_eq!(
+        fails(&mut s, "VACUUM FULL t").code,
+        code::FEATURE_NOT_SUPPORTED
+    );
+    let r = s.execute("VACUUM t_pkey").unwrap();
+    assert!(r[0].notices[0].contains("cannot vacuum non-tables"));
+    ok(&mut s, "BEGIN");
+    assert_eq!(fails(&mut s, "VACUUM t").code, code::ACTIVE_SQL_TRANSACTION);
+    assert_eq!(s.status(), 'E');
+    ok(&mut s, "ROLLBACK");
+}

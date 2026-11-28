@@ -461,21 +461,26 @@ impl HeapFile {
         blk: BlockNumber,
         horizon: Xid,
         tm: &dyn TransactionManager,
-    ) -> Result<Vec<Tid>> {
+    ) -> Result<Prune> {
         let pin = self.pool.fetch(self.tag(blk))?;
         let mut page = pin.write();
+        let mut out = Prune::default();
         if is_new_page(&page) {
-            return Ok(Vec::new());
+            return Ok(out);
         }
         let mut newly_dead = Vec::new();
         {
             let p = SlottedPage::open(&page[..])?;
             for s in 0..p.slot_count() {
                 let slot = SlotId(s);
-                if let Some(t) = p.get_item(slot)
-                    && satisfies_vacuum(&TupleHeader::decode(t)?, horizon, tm)? == VacuumState::Dead
-                {
-                    newly_dead.push(slot);
+                let Some(t) = p.get_item(slot) else {
+                    continue;
+                };
+                match satisfies_vacuum(&TupleHeader::decode(t)?, horizon, tm)? {
+                    VacuumState::Dead => newly_dead.push(slot),
+                    VacuumState::Live | VacuumState::DeleteInProgress => out.live += 1,
+                    VacuumState::RecentlyDead => out.recently_dead += 1,
+                    VacuumState::InsertInProgress => {}
                 }
             }
         }
@@ -491,14 +496,15 @@ impl HeapFile {
             self.log1(Record::new(RmgrId::Heap, info::PRUNE), b, &mut page);
         }
         let p = SlottedPage::open(&page[..])?;
-        Ok((0..p.slot_count())
+        out.dead = (0..p.slot_count())
             .map(SlotId)
             .filter(|&s| {
                 p.item_id(s)
                     .is_some_and(|id| id.state == crate::storage::slotted::ItemState::Dead)
             })
             .map(|slot| Tid { blk, slot })
-            .collect())
+            .collect();
+        Ok(out)
     }
 
     /// Vacuum's last heap step: marks `slots` of `blk` (DEAD, and no longer
@@ -701,6 +707,18 @@ impl HeapFile {
             })
             .collect())
     }
+}
+
+/// What pruning one heap page found.
+#[derive(Debug, Default)]
+pub struct Prune {
+    /// DEAD line pointers on the page (newly pruned or left by an earlier
+    /// run), to be removed from indexes.
+    pub dead: Vec<Tid>,
+    /// Tuples visible to someone, including ones being deleted.
+    pub live: usize,
+    /// Deleted tuples some snapshot may still see.
+    pub recently_dead: usize,
 }
 
 /// State of a tuple version for vacuum (PostgreSQL's HTSV_Result).
@@ -1962,7 +1980,8 @@ mod tests {
             let dead = e
                 .heap
                 .prune_page(blk, tm.oldest_xmin(), tm.as_ref())
-                .unwrap();
+                .unwrap()
+                .dead;
             assert_eq!(dead.len(), 20);
             assert!(free(&e) > before);
             assert!(dead.iter().all(|t| e.heap.fetch(*t).unwrap().is_none()));
@@ -1974,7 +1993,8 @@ mod tests {
             assert_eq!(
                 e.heap
                     .prune_page(blk, tm.oldest_xmin(), tm.as_ref())
-                    .unwrap(),
+                    .unwrap()
+                    .dead,
                 dead
             );
 
@@ -1988,7 +2008,8 @@ mod tests {
             assert_eq!(
                 e.heap
                     .prune_page(blk, tm.oldest_xmin(), tm.as_ref())
-                    .unwrap(),
+                    .unwrap()
+                    .dead,
                 dead
             );
         }
@@ -2010,7 +2031,8 @@ mod tests {
             let dead = e
                 .heap
                 .prune_page(BlockNumber(0), tm.oldest_xmin(), tm.as_ref())
-                .unwrap();
+                .unwrap()
+                .dead;
             assert_eq!(dead.len(), victims.len());
             let slots: Vec<SlotId> = dead.iter().map(|t| t.slot).collect();
             assert_eq!(

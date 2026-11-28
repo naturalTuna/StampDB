@@ -20,6 +20,9 @@ pub const SYS_INDEX_INDRELID_INDEX: RelFileId = RelFileId(2679);
 pub const SYS_CONSTRAINT: RelFileId = RelFileId(2606);
 pub const SYS_CONSTRAINT_CONRELID_INDEX: RelFileId = RelFileId(2665);
 
+/// The system tables (their oids equal their relation ids).
+pub const SYSTEM_TABLES: [RelFileId; 4] = [SYS_CLASS, SYS_ATTRIBUTE, SYS_INDEX, SYS_CONSTRAINT];
+
 /// `relkind` values.
 pub const RELKIND_TABLE: &str = "r";
 pub const RELKIND_INDEX: &str = "i";

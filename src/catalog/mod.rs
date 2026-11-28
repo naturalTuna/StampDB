@@ -1210,25 +1210,48 @@ impl Catalog {
     /// by DROP and by aborted or repeated DDL).
     pub fn vacuum_system(&self, txn: &mut Transaction) -> Result<crate::vacuum::VacuumStats> {
         let mut total = crate::vacuum::VacuumStats::default();
-        for (table, heap) in [
-            (SYS_CLASS, &self.class),
-            (SYS_ATTRIBUTE, &self.attribute),
-            (SYS_INDEX, &self.index),
-            (SYS_CONSTRAINT, &self.constraint),
-        ] {
-            let trees: Vec<&BTree> = self
-                .indexes
-                .iter()
-                .filter(|(i, _)| i.table == table)
-                .map(|(_, t)| t)
-                .collect();
-            let s = crate::vacuum::vacuum(heap, &trees, txn)?;
-            total.heap_pages += s.heap_pages;
-            total.tuples_removed += s.tuples_removed;
-            total.index_entries_removed += s.index_entries_removed;
-            total.index_pages_deleted += s.index_pages_deleted;
+        for table in SYSTEM_TABLES {
+            total.add(&self.vacuum_system_table(txn, table)?);
         }
         Ok(total)
+    }
+
+    /// Vacuums one system table and its indexes.
+    pub fn vacuum_system_table(
+        &self,
+        txn: &mut Transaction,
+        table: RelFileId,
+    ) -> Result<crate::vacuum::VacuumStats> {
+        let trees: Vec<&BTree> = self
+            .indexes
+            .iter()
+            .filter(|(i, _)| i.table == table)
+            .map(|(_, t)| t)
+            .collect();
+        Ok(crate::vacuum::vacuum(self.heap(table)?, &trees, txn)?)
+    }
+
+    /// All tables (system tables included), by oid, as `txn` sees them.
+    pub fn tables(&self, txn: &mut Transaction) -> Result<Vec<RelationInfo>> {
+        let snap = txn.snapshot();
+        let me = Me {
+            xid: txn.xid(),
+            cid: txn.command_id(),
+        };
+        let mut rows = Vec::new();
+        for r in self.class.scan_mvcc(snap, me, txn.tm())? {
+            let (_, row) = r?;
+            let row = deform_tuple(&class_desc(), &row)?;
+            if text(&row, 2)? == RELKIND_TABLE {
+                rows.push(row);
+            }
+        }
+        let mut out = rows
+            .iter()
+            .map(|r| self.relation_from_row(txn, r))
+            .collect::<Result<Vec<_>>>()?;
+        out.sort_by_key(|r| r.oid);
+        Ok(out)
     }
 
     /// The relation named `name`, as `txn` sees the catalogs.

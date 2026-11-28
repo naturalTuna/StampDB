@@ -80,6 +80,10 @@ pub enum Utility {
         names: Vec<String>,
         if_exists: bool,
     },
+    /// VACUUM of one table, or of every table (`None`).
+    Vacuum {
+        table: Option<String>,
+    },
 }
 
 /// A table constraint as written in CREATE TABLE.
@@ -547,6 +551,21 @@ pub fn classify(stmt: &ast::Statement) -> Result<Kind<'_>> {
                 columns,
                 unique: ci.unique,
                 if_not_exists: ci.if_not_exists,
+            }
+        }
+        S::Vacuum(v) => {
+            if v.full
+                || v.sort_only
+                || v.delete_only
+                || v.reindex
+                || v.recluster
+                || v.boost
+                || v.threshold.is_some()
+            {
+                return Err(SqlError::unsupported(format!("statement {stmt}")));
+            }
+            Utility::Vacuum {
+                table: v.table_name.as_ref().map(object_name).transpose()?,
             }
         }
         _ => return Err(SqlError::unsupported(format!("statement {stmt}"))),
