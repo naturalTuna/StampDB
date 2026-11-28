@@ -4,6 +4,12 @@
 decisions의 변경은 채팅 리뷰를 거친 뒤에만 반영하고, 반영 시 아래 변경 이력에 남긴다.
 
 ## 변경 이력
+- r14 (2026-11-28)
+  - [추가] 테이블 통계: 메모리 기반 테이블별 카운터(삽입/수정/삭제 수, 살아 있는/죽은 튜플 수, vacuum 시각·횟수), 트랜잭션 종료 시 PG 규칙으로 반영, 재시작 시 초기화, 시스템 테이블 포함.
+  - [추가] SQL VACUUM 명령(테이블 목록 또는 전체, 트랜잭션 블록 안에서는 25001, 옵션 미지원), vacuum 후 살아 있는/남은 죽은 튜플 수로 통계 갱신.
+  - [추가] autovacuum: 백그라운드 스레드 하나, naptime 마다 임계식(50 + 0.2 × 살아 있는 튜플)을 넘은 테이블을 vacuum, 테이블 lock을 즉시 못 얻으면 건너뜀, 삽입 기반 autovacuum 없음.
+  - [추가] 통계 뷰 pg_stat_user_tables(일부 컬럼)를 읽기 전용 가상 relation으로 노출. pg_stat_activity, pg_locks는 13단계. (open_questions 관측성 항목 중 통계 뷰 부분, 답변: 추천)
+  - [수정] 플래너 통계(행 수, 컬럼 분포)는 12단계에 넣지 않는다. 규칙 기반 플래너는 비용 기반 플래너(ANALYZE 포함, 단계 미정) 전까지 유지.
 - r13 (2026-11-27)
   - [추가] 키 잠금: lock manager의 Key 태그(unique 인덱스, 인코딩된 키), 트랜잭션 종료까지 유지, 자식 Share / 부모 삭제·키 변경 Exclusive, deadlock 검출 공유, 상한(기본 100만 키) 초과 시 53200.
   - [추가] FK 검사: NO ACTION과 RESTRICT는 같게 행 단위 즉시 검사, 부모 쪽 참조 확인은 자식 인덱스(있으면) 또는 seq scan, 자식 인덱스 강제 생성 없음, SI에서 스냅샷 이후 커밋된 행이 관련되면 직렬화 오류.
@@ -262,7 +268,7 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 [SQL 실행]
 - 9단계 범위: CREATE/DROP TABLE·INDEX, INSERT(VALUES, SELECT), SELECT(WHERE, INNER/LEFT JOIN, GROUP BY, 집계 count/sum/avg/min/max, HAVING, ORDER BY, LIMIT/OFFSET, DISTINCT), UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK와 격리 수준 지정.
   서브쿼리, 윈도 함수, CTE는 이후로 미룬다.
-- 플래너는 통계(12단계) 전까지 규칙 기반이다: WHERE에 인덱스 선두 컬럼의 등호·범위 조건이 있으면 index scan, 등호 조인은 hash join, 나머지는 nested loop. 인덱스 조건으로 고른 행도 WHERE 전체로 다시 검사한다.
+- 플래너는 비용 기반 플래너(ANALYZE 포함, 단계 미정) 전까지 규칙 기반이다 (r14: 12단계에서 플래너 통계를 수집하지 않는다): WHERE에 인덱스 선두 컬럼의 등호·범위 조건이 있으면 index scan, 등호 조인은 hash join, 나머지는 nested loop. 인덱스 조건으로 고른 행도 WHERE 전체로 다시 검사한다.
 - hash join, 집계, 정렬, DISTINCT는 메모리 안에서만 처리한다 (work_mem 초과 시 디스크 spill 없음).
 - 타입 규칙은 PG를 따른다: 정수 리터럴은 int4(넘치면 int8), 문자열 리터럴은 문맥 타입으로 변환되는 unknown, 정수 나눗셈은 정수, 정수 overflow와 0 나누기는 오류, NULL은 3값 논리.
   소수 리터럴은 PG처럼 numeric이다. NUMERIC 구현 전에는 float8로 암묵 변환되는 문맥에서만 허용하고, 결과가 numeric이 되는 식(소수 리터럴 단독, avg(정수), sum(int8))은 0A000 오류로 거부한다.
@@ -305,6 +311,15 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - 수동 VACUUM 명령과 autovacuum을 모두 지원한다. 수동 VACUUM을 먼저 구현한다.
 - autovacuum 판단을 위해 테이블별 통계(삽입/수정/삭제 수, 죽은 튜플 수)를 수집한다.
 - autovacuum은 서버 내부의 백그라운드 워커 스레드로 동작한다.
+- 테이블 통계(r14)는 메모리에만 둔다: 테이블 oid별 n_tup_ins/upd/del, n_live_tup, n_dead_tup, last_vacuum/last_autovacuum, vacuum_count/autovacuum_count. 재시작하면 초기화된다 (PG는 크래시 후 초기화, 정상 종료 시 보존).
+  근거: autovacuum 판단용 추정치라 정확할 필요가 없고, 영속화하면 WAL·파일 형식이 늘어난다.
+- 트랜잭션은 테이블별 삽입/수정/삭제 수를 모았다가 종료 시 반영한다 (PG pgstat 규칙): 수 자체는 항상 더한다. 커밋이면 live += 삽입 − 삭제, dead += 수정 + 삭제, abort이면 dead += 삽입 + 수정. 시스템 테이블도 같은 규칙으로 센다.
+- vacuum이 끝나면 n_live_tup = vacuum이 센 살아 있는 튜플(삭제 진행 중 포함), n_dead_tup = 아직 지울 수 없는 죽은 튜플(RecentlyDead)로 덮어쓴다 (PG와 같은 경쟁 허용: vacuum 중 반영된 변경이 일부 사라질 수 있다).
+- SQL `VACUUM [테이블, ...]`: 이름이 없으면 모든 사용자 테이블과 시스템 테이블. 트랜잭션 블록 안에서는 25001, 옵션(FULL, ANALYZE 등)은 0A000. 테이블마다 별도 트랜잭션.
+- autovacuum(r14): 스레드 하나가 naptime(기본 60초)마다 통계를 훑어 n_dead_tup > 50 + 0.2 × n_live_tup인 테이블을 vacuum한다 (PG autovacuum_vacuum_threshold/scale_factor 기본값). PG는 launcher와 여러 worker로 나뉜다.
+  테이블 lock은 기다리지 않고 시도해 실패하면 다음 회차로 넘긴다. PG처럼 실행 중에 충돌 lock 요청이 오면 스스로 취소하는 기능은 없다 (DDL이 끝날 때까지 기다린다).
+  삽입 기반 autovacuum(PG 13+)은 visibility map·freeze가 없어 두지 않는다. 설정값은 구조체로 받고 13단계에서 서버 설정으로 노출한다.
+- 통계 뷰 pg_stat_user_tables(relid, relname, n_tup_ins, n_tup_upd, n_tup_del, n_live_tup, n_dead_tup, last_vacuum, last_autovacuum, vacuum_count, autovacuum_count)는 읽기 전용 가상 relation이다. 시각은 timestamp(UTC)로 낸다 (timestamptz 없음).
 - vacuum은 heap의 죽은 튜플과 인덱스의 죽은 엔트리를 함께 정리하고, 빈 B+Tree 페이지를 삭제한다.
 - 64비트 xid이므로 wraparound 방지용 freeze는 필요 없다. 다만 오래된 CLOG를 잘라내기 위한 커밋 확정 처리는 이후 추가한다.
 - 정리 기준(horizon): 각 트랜잭션이 자기 스냅샷의 xmin을 실행 중 목록에 등록한다 (PG의 MyProc->xmin). horizon = min(등록된 xmin, 실행 중 xid, next_xid).
@@ -429,6 +444,7 @@ PostgreSQL과 Oracle의 아키텍처를 개념 수준에서 이해하고 있다
 - 관측성. (요청: 추천)
   제안: 로그 우선. tracing 크레이트로 1단계부터 구조화 로그(세션 ID, xid, LSN 필드).
   통계 뷰(pg_stat_activity, pg_stat_user_tables, pg_locks)는 12단계 통계 수집 시 함께 노출.
+  (r14: pg_stat_user_tables는 12단계에서 decisions로 반영, pg_stat_activity와 pg_locks는 13단계)
 
 [미결]
 - 복제/witness 채널의 인증: 노드 간 WAL 스트림, 승격 명령, witness 통신을 trust + IP 목록으로 둘지, 별도 인증(공유 비밀, mTLS 등)을 둘지. 14단계 전 결정.

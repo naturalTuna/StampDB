@@ -9,7 +9,7 @@ Rust로 구현하는 학습용 OLTP 데이터베이스. PostgreSQL 와이어 프
 - `DESIGN.md`의 decisions, ha_and_backup_design, open_questions는 사용자가 명시적으로 지시할 때만 수정한다.
 
 ## 현재 단계
-- 1단계 11번: 행 단위 잠금 테이블 + FOREIGN KEY
+- 1단계 12번: 테이블별 통계 수집 + autovacuum
   (단계가 끝나면 사용자가 이 줄을 갱신한다)
 
 ## 진행 상황과 환경
